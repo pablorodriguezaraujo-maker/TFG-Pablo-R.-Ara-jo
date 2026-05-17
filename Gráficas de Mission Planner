@@ -1,0 +1,1720 @@
+"""
+Visualizador de Logs de Mission Planner para Octorotor
+=======================================================
+Lee archivos de telemetría .bin (o .log de texto) generados por
+Mission Planner y ofrece un menú interactivo para generar gráficas
+de actitud, altitud, GPS, motores, IMU, batería, AGL y velocidad.
+
+Rutas de log configuradas para tres ciudades gallegas:
+    1. A Coruña
+    2. Santiago de Compostela
+    3. Vigo
+"""
+
+import math
+import sys
+
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+try:
+    from pymavlink import mavutil
+except ImportError:
+    print("pymavlink no encontrado. Instalando...")
+    import subprocess
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "pymavlink"]
+    )
+    from pymavlink import mavutil
+
+
+# ---------------------------------------------------------------------------
+# Constantes de configuración
+# ---------------------------------------------------------------------------
+
+# Rango válido de señal PWM para salidas de servo/motor (µs)
+PWM_MIN = 800
+PWM_MAX = 2400
+
+# Factor de escala para coordenadas GPS almacenadas en grados × 1e7
+GPS_SCALE_FACTOR = 1e7
+# Umbral para detectar si las coordenadas necesitan normalización
+GPS_RAW_THRESHOLD = 1000
+
+# Factor de conversión de microsegundos a segundos
+US_TO_S = 1_000_000.0
+
+# Ventana de suavizado por defecto para media móvil (muestras)
+SMOOTHING_WINDOW = 11
+
+# Radio medio de la Tierra en metros (para fórmula Haversine)
+EARTH_RADIUS_M = 6_371_000.0
+
+# Umbral para detectar si la velocidad GPS está en cm/s en lugar de m/s
+SPEED_CMS_THRESHOLD = 120.0
+
+# Rango de voltaje válido para la batería (V)
+BAT_VOLT_MIN = 0.0
+BAT_VOLT_MAX = 100.0
+
+# Rango de corriente válida para la batería (A)
+BAT_CURR_MIN = -5.0
+BAT_CURR_MAX = 500.0
+
+# Separador visual para la consola
+SEPARATOR = "=" * 60
+
+# Rutas de log por ciudad
+CITY_LOG_FILES = {
+    'coruna': (
+        r"C:\Users\pablo\Documents\Mission Planner\logs"
+        r"\OCTOROTOR\1\2026-05-12 02-37-24.bin"
+    ),
+    'santiago': (
+        r"C:\Users\pablo\Documents\Mission Planner\logs"
+        r"\OCTOROTOR\1\2026-05-12 02-46-51.bin"
+    ),
+    'vigo': (
+        r"C:\Users\pablo\Documents\Mission Planner\logs"
+        r"\OCTOROTOR\1\2026-05-11 14-06-01.bin"
+    ),
+}
+
+# Orden de presentación de ciudades en el menú
+CITY_ORDER = ['coruna', 'santiago', 'vigo']
+
+# Nombres completos de las ciudades para títulos y mensajes
+CITY_LABELS = {
+    'coruna': 'A Coruña',
+    'santiago': 'Santiago de Compostela',
+    'vigo': 'Vigo',
+}
+
+# Alias que se aceptan en el prompt del menú (entrada en minúsculas)
+CITY_ALIASES = {
+    '1': 'coruna',
+    '2': 'santiago',
+    '3': 'vigo',
+    'vigo': 'vigo',
+    'coruna': 'coruna',
+    'coruña': 'coruna',
+    'a coruna': 'coruna',
+    'a coruña': 'coruna',
+    'santiago': 'santiago',
+    'santiago de compostela': 'santiago',
+}
+
+# Carpeta raíz para guardar gráficas
+OUTPUT_DIR = Path(r'C:\Users\pablo\graficas_octorotor')
+
+# Subcarpetas por ciudad
+CITY_OUTPUT_DIRS = {
+    'coruna': OUTPUT_DIR / 'coruña',
+    'santiago': OUTPUT_DIR / 'santiago',
+    'vigo': OUTPUT_DIR / 'vigo',
+}
+
+# Carpeta para gráficas comparativas
+COMPARISON_OUTPUT_DIR = OUTPUT_DIR / 'comparativas'
+
+
+# ---------------------------------------------------------------------------
+# Clase principal
+# ---------------------------------------------------------------------------
+
+class MissionPlannerVisualizer:
+    """Visualizador de logs de Mission Planner para octorotor.
+
+    Parámetros:
+        log_file: Ruta al archivo de log (.bin binario o .log texto).
+        city_name: Nombre de la ciudad que se añade al título de cada
+            gráfica.  Puede quedar vacío si no se desea ese etiquetado.
+    """
+
+    def __init__(self, log_file, city_name="", city_key=None):
+        self.log_file = Path(log_file)
+        self.city_name = city_name
+        self.city_key = city_key
+        # Diccionario {tipo_mensaje: [mensajes]} que se rellena al leer.
+        self.data = {}
+        # Carpeta de salida para gráficas de esta ciudad
+        self.output_dir = CITY_OUTPUT_DIRS.get(city_key) if city_key else None
+        if self.output_dir:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Helpers internos
+    # ------------------------------------------------------------------
+
+    def _title_with_city(self, base_title):
+        """Devuelve ``base_title`` seguido del nombre de ciudad.
+
+        Si ``city_name`` está vacío devuelve ``base_title`` sin cambios.
+
+        Parámetros:
+            base_title (str): Título base de la gráfica.
+
+        Devuelve:
+            str: Título compuesto, p.ej. ``"Actitud - A Coruña"``.
+        """
+        if self.city_name:
+            return f"{base_title} - {self.city_name}"
+        return base_title
+
+    def _save_figure(self, fig, base_filename):
+        """Guarda la figura actual en la carpeta de la ciudad.
+
+        Parámetros:
+            fig: Objeto figura de matplotlib.
+            base_filename (str): Nombre base sin extensión, p.ej.
+                'actitud', 'velocidad'.
+        """
+        if not self.output_dir:
+            return
+        filename = f"{base_filename}.png"
+        filepath = self.output_dir / filename
+        try:
+            fig.savefig(filepath, dpi=100, bbox_inches='tight')
+            print(f"  ✓ Guardada: {filepath.name}")
+        except Exception as exc:
+            print(f"  ✗ Error guardando {filename}: {exc}")
+
+    @staticmethod
+    def _get_float_field(msg, field_name, default=0.0):
+        """Extrae un campo de un mensaje como ``float``.
+
+        Admite mensajes de tipo ``dict`` (logs de texto) y mensajes
+        objeto de pymavlink (logs binarios).
+
+        Parámetros:
+            msg: Mensaje del que extraer el campo.
+            field_name (str): Nombre del campo.
+            default (float): Valor devuelto cuando el campo no existe o
+                no se puede convertir.
+
+        Devuelve:
+            float: Valor del campo convertido a flotante.
+        """
+        try:
+            value = (
+                msg.get(field_name, default)
+                if isinstance(msg, dict)
+                else getattr(msg, field_name, default)
+            )
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _extract_series(self, msg_type, fields):
+        """Construye un diccionario de listas numéricas por campo.
+
+        Parámetros:
+            msg_type (str): Clave del tipo de mensaje en ``self.data``.
+            fields (iterable): Nombres de los campos a extraer.
+
+        Devuelve:
+            dict[str, list[float]] | None: Diccionario campo → valores,
+            o ``None`` si ``msg_type`` no está en ``self.data``.
+        """
+        if msg_type not in self.data:
+            return None
+
+        messages = self.data[msg_type]
+        return {
+            field: [
+                self._get_float_field(msg, field) for msg in messages
+            ]
+            for field in fields
+        }
+
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        """Distancia en metros entre dos coordenadas geográficas.
+
+        Usa la fórmula Haversine sobre una esfera de radio ``EARTH_RADIUS_M``.
+
+        Parámetros:
+            lat1, lon1 (float): Coordenadas del primer punto (grados).
+            lat2, lon2 (float): Coordenadas del segundo punto (grados).
+
+        Devuelve:
+            float: Distancia en metros.
+        """
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        d_lat = math.radians(lat2 - lat1)
+        d_lon = math.radians(lon2 - lon1)
+
+        a = (
+            math.sin(d_lat / 2) ** 2
+            + math.cos(phi1) * math.cos(phi2) * math.sin(d_lon / 2) ** 2
+        )
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return EARTH_RADIUS_M * c
+
+    @staticmethod
+    def _moving_average(values, window=SMOOTHING_WINDOW):
+        """Suaviza una señal con media móvil de ventana centrada.
+
+        El tamaño de ventana se ajusta automáticamente para ser impar y
+        no mayor que la longitud de la señal.  Los extremos se rellenan
+        repitiendo el primer y último valor (padding de borde).
+
+        Parámetros:
+            values (list[float]): Serie de valores a suavizar.
+            window (int): Número de muestras de la ventana.
+
+        Devuelve:
+            list[float]: Serie suavizada de la misma longitud.
+        """
+        if not values:
+            return values
+
+        n = len(values)
+        # Garantiza ventana impar y dentro de rango válido
+        window = max(1, min(window, n))
+        if window % 2 == 0:
+            window -= 1
+        if window <= 1:
+            return values[:]
+
+        half = window // 2
+        # Relleno de borde para conservar la longitud original
+        padded = [values[0]] * half + values + [values[-1]] * half
+        return [
+            sum(padded[i: i + window]) / window
+            for i in range(n)
+        ]
+
+    def _get_valid_gps_points(self):
+        """Devuelve la lista de puntos GPS válidos del log.
+
+        Cada punto es una tupla ``(lat, lon, time_us)`` donde:
+        - ``lat`` y ``lon`` están en grados decimales (rango estándar).
+        - ``time_us`` es el timestamp en microsegundos o ``None``.
+
+        Normaliza automáticamente coordenadas almacenadas como
+        grados × 1e7 (formato habitual en ArduPilot/APM).
+
+        Devuelve:
+            list[tuple[float, float, float | None]]: Puntos GPS válidos.
+        """
+        if 'GPS' not in self.data:
+            return []
+
+        points = []
+        for msg in self.data['GPS']:
+            # Lectura compatible con dict (texto) y objeto (binario)
+            if isinstance(msg, dict):
+                lat = msg.get('Lat')
+                lon = msg.get('Lng')
+                t_us = msg.get('TimeUS')
+            else:
+                lat = getattr(msg, 'Lat', None)
+                lon = getattr(msg, 'Lng', None)
+                t_us = getattr(msg, 'TimeUS', None)
+
+            if lat is None or lon is None:
+                continue
+
+            try:
+                lat = float(lat)
+                lon = float(lon)
+            except (TypeError, ValueError):
+                continue
+
+            # ArduPilot puede almacenar coordenadas en grados × 1e7.
+            if abs(lat) > GPS_RAW_THRESHOLD or abs(lon) > GPS_RAW_THRESHOLD:
+                lat /= GPS_SCALE_FACTOR
+                lon /= GPS_SCALE_FACTOR
+
+            # Descarta puntos fuera del rango geográfico válido
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                continue
+
+            if t_us is not None:
+                try:
+                    t_us = float(t_us)
+                except (TypeError, ValueError):
+                    t_us = None
+
+            points.append((lat, lon, t_us))
+
+        return points
+
+    # ------------------------------------------------------------------
+    # Lectura del log
+    # ------------------------------------------------------------------
+
+    def read_log(self):
+        """Lee el archivo de log y carga los datos en ``self.data``.
+
+        Selecciona el método de lectura según la extensión del archivo:
+        - ``.bin`` → lectura binaria con pymavlink.
+        - cualquier otra extensión → lectura de texto línea a línea.
+
+        Lanza:
+            FileNotFoundError: Si el archivo no existe en disco.
+        """
+        if not self.log_file.exists():
+            raise FileNotFoundError(
+                f"Archivo de log no encontrado: {self.log_file}"
+            )
+
+        print(f"Leyendo archivo: {self.log_file}")
+
+        if self.log_file.suffix.lower() == ".bin":
+            self._read_binary_log()
+        else:
+            self._read_text_log()
+
+    def _read_binary_log(self):
+        """Carga un log binario .bin usando pymavlink.
+
+        Itera todos los mensajes disponibles en el archivo y los
+        agrupa en ``self.data`` por tipo de mensaje.
+
+        Lanza:
+            ValueError: Si pymavlink no puede abrir o leer el archivo.
+        """
+        try:
+            reader = mavutil.mavlink_connection(str(self.log_file))
+
+            while True:
+                msg = reader.recv_match()
+                if msg is None:
+                    break
+
+                msg_type = msg.get_type()
+                self.data.setdefault(msg_type, []).append(msg)
+
+            tipos = list(self.data.keys())
+            print(
+                f"✓ Log binario leído correctamente. "
+                f"Tipos de mensajes: {tipos}"
+            )
+        except Exception as exc:
+            raise ValueError(f"Error leyendo log binario: {exc}") from exc
+
+    def _read_text_log(self):
+        """Carga un log de texto línea a línea.
+
+        Intenta UTF-8 primero y cae a Latin-1 si hay error de codec.
+        Las líneas FMT (definiciones de formato) se ignoran; el resto
+        se parsea como CSV usando la cabecera más reciente detectada.
+        """
+        try:
+            with open(
+                self.log_file, 'r', encoding='utf-8', errors='ignore'
+            ) as fh:
+                lines = fh.readlines()
+        except OSError:
+            with open(
+                self.log_file, 'r', encoding='latin-1', errors='ignore'
+            ) as fh:
+                lines = fh.readlines()
+
+        header = None
+        for line in lines:
+            if line.startswith('FMT'):
+                continue
+            if line.startswith('FIELDS'):
+                # Nueva cabecera de columnas
+                header = line.split(',')[1:]
+                continue
+            if header:
+                values = line.split(',')
+                msg_type = values[0]
+                self.data.setdefault(
+                    msg_type, []
+                ).append(dict(zip(header, values[1:])))
+
+        print(
+            f"✓ Log de texto leído correctamente. "
+            f"Tipos: {list(self.data.keys())}"
+        )
+
+    # ------------------------------------------------------------------
+    # Métricas de ruta
+    # ------------------------------------------------------------------
+
+    def report_route_metrics(self):
+        """Imprime un resumen de distancia, tiempo y velocidad media.
+
+        Utiliza los puntos GPS válidos obtenidos con
+        ``_get_valid_gps_points()`` y la distancia Haversine entre
+        puntos consecutivos.  El tiempo total se deduce de ``TimeUS``.
+        """
+        points = self._get_valid_gps_points()
+        if len(points) < 2:
+            print("⚠ No hay suficientes puntos GPS válidos para calcular ruta")
+            return
+
+        # Suma de distancias entre puntos GPS consecutivos
+        total_m = sum(
+            self._haversine_m(
+                points[i - 1][0], points[i - 1][1],
+                points[i][0], points[i][1]
+            )
+            for i in range(1, len(points))
+        )
+
+        # Tiempo total usando timestamps en microsegundos
+        times = [p[2] for p in points if p[2] is not None]
+        if len(times) >= 2:
+            total_s = max(0.0, (times[-1] - times[0]) / US_TO_S)
+        else:
+            total_s = float('nan')
+
+        print("\n=== Resumen de Ruta ===")
+        print(f"Puntos GPS válidos : {len(points)}")
+        print(
+            f"Distancia recorrida: {total_m:.2f} m "
+            f"({total_m / 1000:.3f} km)"
+        )
+        if math.isnan(total_s):
+            print("Tiempo total       : no disponible (TimeUS no encontrado)")
+        else:
+            print(
+                f"Tiempo total       : {total_s:.2f} s "
+                f"({total_s / 60:.2f} min)"
+            )
+            if total_s > 0:
+                v_ms = total_m / total_s
+                print(
+                    f"Velocidad media    : {v_ms:.2f} m/s "
+                    f"({v_ms * 3.6:.2f} km/h)"
+                )
+
+    # ------------------------------------------------------------------
+    # Gráficas individuales
+    # ------------------------------------------------------------------
+
+    def visualize_attitude(self):
+        """Grafica la actitud del dron: Roll, Pitch y Yaw.
+
+        Fuente de datos: mensajes ``ATT``.
+        Los ángulos se expresan en grados.
+        """
+        if 'ATT' not in self.data:
+            print("⚠ Datos de ATT (actitud) no encontrados")
+            return
+
+        series = self._extract_series('ATT', ('Roll', 'Pitch', 'Yaw'))
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(series['Roll'], label='Roll', linewidth=2)
+        plt.plot(series['Pitch'], label='Pitch', linewidth=2)
+        plt.plot(series['Yaw'], label='Yaw', linewidth=2)
+        plt.xlabel('Tiempo (muestras)')
+        plt.ylabel('Ángulo (grados)')
+        plt.title(
+            self._title_with_city('Actitud del Octorotor (Roll, Pitch, Yaw)')
+        )
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'actitud')
+        plt.show()
+
+    def visualize_altitude(self):
+        """Grafica la altitud barométrica del dron.
+
+        Fuente de datos: campo ``Alt`` de mensajes ``BARO``.
+        """
+        if 'BARO' not in self.data:
+            print("⚠ Datos de BARO (altitud) no encontrados")
+            return
+
+        altitude = self._extract_series('BARO', ('Alt',))['Alt']
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(altitude, label='Altitud', linewidth=2, color='green')
+        plt.xlabel('Tiempo (muestras)')
+        plt.ylabel('Altitud (metros)')
+        plt.title(self._title_with_city('Altitud del Octorotor'))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'altitud')
+        plt.show()
+
+    def visualize_altitude_terrain(self):
+        """Grafica la altura sobre el terreno (AGL).
+
+        Fuente de datos: campo ``CHeight`` de mensajes ``TERR``.
+        """
+        if 'TERR' not in self.data:
+            print("⚠ Datos de TERR (terreno) no encontrados")
+            return
+
+        agl = self._extract_series('TERR', ('CHeight',))['CHeight']
+
+        if not agl or all(v == 0 for v in agl):
+            print("⚠ No hay valores válidos de altura sobre terreno (CHeight)")
+            return
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(
+            agl,
+            label='Altura sobre terreno (AGL)',
+            linewidth=2,
+            color='orange',
+        )
+        plt.xlabel('Tiempo (muestras)')
+        plt.ylabel('Altura sobre terreno (m)')
+        plt.title(self._title_with_city('Altitud respecto al terreno (AGL)'))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'altitud_terreno')
+        plt.show()
+
+    def visualize_gps(self):
+        """Grafica la trayectoria GPS del dron sobre un plano lon/lat.
+
+        Fuente de datos: campos ``Lat`` y ``Lng`` de mensajes ``GPS``.
+        Los puntos se colorean según el orden temporal para indicar
+        el avance de la ruta.
+        """
+        if 'GPS' not in self.data:
+            print("⚠ Datos de GPS no encontrados")
+            return
+
+        raw = self._extract_series('GPS', ('Lat', 'Lng'))
+        lat_list = []
+        lon_list = []
+
+        for lat, lon in zip(raw['Lat'], raw['Lng']):
+            # Normaliza si las coordenadas vienen en grados × 1e7
+            if abs(lat) > GPS_RAW_THRESHOLD or abs(lon) > GPS_RAW_THRESHOLD:
+                lat /= GPS_SCALE_FACTOR
+                lon /= GPS_SCALE_FACTOR
+
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                lat_list.append(lat)
+                lon_list.append(lon)
+
+        if len(lat_list) < 2:
+            print("⚠ No hay suficientes puntos GPS válidos para graficar")
+            return
+
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(
+            lon_list, lat_list,
+            c=range(len(lat_list)),
+            cmap='viridis',
+            s=10,
+        )
+        plt.xlabel('Longitud')
+        plt.ylabel('Latitud')
+        plt.title(self._title_with_city('Trayectoria GPS del Octorotor'))
+        plt.colorbar(scatter, label='Tiempo (muestras)')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'gps')
+        plt.show()
+
+    def visualize_motors(self):
+        """Grafica la señal PWM de los 8 motores del octorotor.
+
+        Fuente de datos: mensajes ``RCOU`` y/o ``RCO2``.
+        Para cada motor busca el campo por varios nombres candidatos
+        (Ch1…Ch8, C1…C8, Servo1…Servo8, etc.) y filtra valores fuera
+        del rango PWM físico [``PWM_MIN``, ``PWM_MAX``].
+        """
+        # Combina fuentes RCOU y RCO2 si existen
+        sources = self.data.get('RCOU', []) + self.data.get('RCO2', [])
+        if not sources:
+            print("⚠ Datos de RCOU/RCO2 (salidas de motores) no encontrados")
+            return
+
+        # Inicializa listas vacías para cada uno de los 8 motores
+        motors = {f'Motor{i}': [] for i in range(1, 9)}
+
+        for msg in sources:
+            for i in range(1, 9):
+                # Nombres de campo usados por distintas versiones de firmware
+                candidates = (
+                    f'Ch{i}', f'C{i}',
+                    f'Servo{i}', f'SERVO{i}',
+                    f'chan{i}_raw',
+                )
+
+                value = None
+                if isinstance(msg, dict):
+                    for key in candidates:
+                        if key in msg:
+                            value = msg[key]
+                            break
+                else:
+                    for key in candidates:
+                        if hasattr(msg, key):
+                            value = getattr(msg, key)
+                            break
+
+                if value is not None:
+                    try:
+                        pwm = float(value)
+                        # Descarta valores fuera del rango PWM físico
+                        if PWM_MIN <= pwm <= PWM_MAX:
+                            motors[f'Motor{i}'].append(pwm)
+                    except (TypeError, ValueError):
+                        pass
+
+        if not any(motors.values()):
+            print(
+                "⚠ Se encontraron mensajes de salida, "
+                "pero sin canales de motores válidos"
+            )
+            return
+
+        plt.figure(figsize=(14, 8))
+        for i, (motor_name, values) in enumerate(motors.items(), 1):
+            if values:
+                plt.subplot(2, 4, i)
+                plt.plot(values, linewidth=1.5, color=f'C{i - 1}')
+                plt.title(self._title_with_city(motor_name))
+                plt.xlabel('Tiempo')
+                plt.ylabel('PWM (µs)')
+                plt.grid(True, alpha=0.3)
+
+        plt.suptitle(
+            self._title_with_city('Velocidad de Motores del Octorotor'),
+            fontsize=14,
+            fontweight='bold',
+        )
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'motores')
+        plt.show()
+
+    def visualize_imu(self):
+        """Grafica los datos del IMU: acelerómetro y giroscopio.
+
+        Fuente de datos: campos ``AccX/Y/Z`` y ``GyrX/Y/Z`` de
+        mensajes ``IMU``.  Genera dos subgráficas en la misma figura.
+        """
+        if 'IMU' not in self.data:
+            print("⚠ Datos de IMU no encontrados")
+            return
+
+        imu = self._extract_series(
+            'IMU', ('AccX', 'AccY', 'AccZ', 'GyrX', 'GyrY', 'GyrZ')
+        )
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+        # --- Subgráfica superior: acelerómetro ---
+        axes[0].plot(imu['AccX'], label='AccX', linewidth=1, alpha=0.7)
+        axes[0].plot(imu['AccY'], label='AccY', linewidth=1, alpha=0.7)
+        axes[0].plot(imu['AccZ'], label='AccZ', linewidth=1, alpha=0.7)
+        axes[0].set_ylabel('Aceleración (m/s²)')
+        axes[0].set_title(self._title_with_city('Acelerómetro del IMU'))
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # --- Subgráfica inferior: giroscopio ---
+        axes[1].plot(imu['GyrX'], label='GyrX', linewidth=1, alpha=0.7)
+        axes[1].plot(imu['GyrY'], label='GyrY', linewidth=1, alpha=0.7)
+        axes[1].plot(imu['GyrZ'], label='GyrZ', linewidth=1, alpha=0.7)
+        axes[1].set_xlabel('Tiempo (muestras)')
+        axes[1].set_ylabel('Velocidad angular (rad/s)')
+        axes[1].set_title(self._title_with_city('Giroscopio del IMU'))
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        fig = plt.gcf()
+        self._save_figure(fig, 'imu')
+
+    def visualize_battery(self):
+        """Grafica el voltaje y la corriente de la batería.
+
+        Fuente de datos: campos ``Volt`` y ``Curr`` de mensajes ``BAT``.
+        Los valores fuera del rango definido por las constantes del
+        módulo se descartan como ruido o errores de lectura.
+        """
+        if 'BAT' not in self.data:
+            print("⚠ Datos de BAT (batería) no encontrados")
+            return
+
+        raw = self._extract_series('BAT', ('Volt', 'Curr'))
+        # Filtra valores fuera de rango físico
+        voltage = [v for v in raw['Volt'] if BAT_VOLT_MIN <= v <= BAT_VOLT_MAX]
+        current = [c for c in raw['Curr'] if BAT_CURR_MIN <= c <= BAT_CURR_MAX]
+
+        if not voltage and not current:
+            print("⚠ Datos de batería inválidos o fuera de rango")
+            return
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+
+        if voltage:
+            axes[0].plot(voltage, linewidth=2, color='red')
+        axes[0].set_ylabel('Voltaje (V)')
+        axes[0].set_title(self._title_with_city('Voltaje de la Batería'))
+        axes[0].grid(True, alpha=0.3)
+
+        if current:
+            axes[1].plot(current, linewidth=2, color='blue')
+        axes[1].set_xlabel('Tiempo (muestras)')
+        axes[1].set_ylabel('Corriente (A)')
+        axes[1].set_title(self._title_with_city('Corriente de la Batería'))
+        axes[1].grid(True, alpha=0.3)
+
+        fig = plt.gcf()
+        self._save_figure(fig, 'bateria')
+
+    def visualize_speed(self):
+        """Grafica la velocidad del dron a lo largo de la ruta.
+
+        Fuente primaria: campo ``Spd`` de mensajes ``GPS``, que suele
+        ser la velocidad sobre tierra (ground speed) calculada por el
+        receptor GPS.  Si no está disponible, se calcula derivando la
+        distancia Haversine entre puntos GPS consecutivos.
+
+        Muestra dos series:
+        - Velocidad bruta (gris semitransparente).
+        - Velocidad suavizada con media móvil de ventana ``SMOOTHING_WINDOW``
+          (línea morada).
+        """
+        if 'GPS' not in self.data:
+            print("⚠ Datos de GPS no encontrados")
+            return
+
+        elapsed_s, speed_kmh = self._compute_speed_series()
+
+        if len(speed_kmh) < 2:
+            print("⚠ No hay suficientes datos para graficar velocidad")
+            return
+
+        speed_smooth = self._moving_average(speed_kmh, window=SMOOTHING_WINDOW)
+
+        plt.figure(figsize=(12, 6))
+        plt.plot(
+            elapsed_s, speed_kmh,
+            linewidth=1.0, alpha=0.35, color='gray',
+            label='Velocidad bruta',
+        )
+        plt.plot(
+            elapsed_s, speed_smooth,
+            linewidth=2.0, color='purple',
+            label='Velocidad suavizada',
+        )
+        plt.xlabel('Tiempo (s)')
+        plt.ylabel('Velocidad (km/h)')
+        plt.title(self._title_with_city('Velocidad del dron por ruta (GPS)'))
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        self._save_figure(plt.gcf(), 'velocidad')
+        plt.show()
+
+    def _compute_speed_series(self):
+        """Calcula las series de tiempo y velocidad en km/h.
+
+        Intenta primero usar el campo ``Spd`` nativo del GPS (más
+        estable).  Como respaldo calcula la velocidad derivando la
+        distancia Haversine entre puntos consecutivos.
+
+        Devuelve:
+            tuple[list[float], list[float]]: ``(elapsed_s, speed_kmh)``
+            con el tiempo transcurrido desde el primer punto (en s) y
+            la velocidad correspondiente (en km/h).
+        """
+        raw_t = []
+        raw_spd = []
+
+        for msg in self.data['GPS']:
+            if isinstance(msg, dict):
+                t_us = msg.get('TimeUS')
+                spd = msg.get('Spd')
+            else:
+                t_us = getattr(msg, 'TimeUS', None)
+                spd = getattr(msg, 'Spd', None)
+
+            if t_us is None or spd is None:
+                continue
+
+            try:
+                raw_t.append(float(t_us))
+                raw_spd.append(float(spd))
+            except (TypeError, ValueError):
+                continue
+
+        if len(raw_t) >= 2:
+            return self._speed_from_spd_field(raw_t, raw_spd)
+
+        # Respaldo: derivar velocidad a partir de coordenadas GPS
+        return self._speed_from_gps_points()
+
+    def _speed_from_spd_field(self, raw_t, raw_spd):
+        """Convierte el campo ``Spd`` del GPS a km/h con eje temporal.
+
+        Detecta automáticamente si los valores están en m/s o cm/s
+        comparando la mediana con ``SPEED_CMS_THRESHOLD``.
+
+        Parámetros:
+            raw_t (list[float]): Timestamps en microsegundos.
+            raw_spd (list[float]): Velocidades tal como las devuelve el log.
+
+        Devuelve:
+            tuple[list[float], list[float]]: ``(elapsed_s, speed_kmh)``.
+        """
+        # Detección de unidades: si la mediana supera el umbral, son cm/s
+        median_spd = sorted(raw_spd)[len(raw_spd) // 2]
+        scale = 0.01 if median_spd > SPEED_CMS_THRESHOLD else 1.0
+
+        elapsed_s = []
+        speed_kmh = []
+        t0 = raw_t[0]
+        last_t = None
+
+        for t_us, spd in zip(raw_t, raw_spd):
+            t_sec = (t_us - t0) / US_TO_S
+            # Descarta muestras con timestamp igual o anterior al previo
+            if last_t is not None and t_sec <= last_t:
+                continue
+            elapsed_s.append(t_sec)
+            speed_kmh.append(max(0.0, spd * scale * 3.6))
+            last_t = t_sec
+
+        return elapsed_s, speed_kmh
+
+    def _speed_from_gps_points(self):
+        """Calcula la velocidad derivando distancia entre puntos GPS.
+
+        Método de respaldo cuando el campo ``Spd`` no está disponible.
+
+        Devuelve:
+            tuple[list[float], list[float]]: ``(elapsed_s, speed_kmh)``.
+        """
+        points = self._get_valid_gps_points()
+        if len(points) < 2:
+            print(
+                "⚠ No hay suficientes puntos GPS válidos "
+                "para calcular velocidad"
+            )
+            return [], []
+
+        t0 = points[0][2]
+        elapsed_s = [0.0]
+        speed_kmh = [0.0]
+
+        for i in range(1, len(points)):
+            lat1, lon1, t1_us = points[i - 1]
+            lat2, lon2, t2_us = points[i]
+            dist_m = self._haversine_m(lat1, lon1, lat2, lon2)
+
+            if t1_us is not None and t2_us is not None:
+                dt_s = (t2_us - t1_us) / US_TO_S
+                spd_kmh = (dist_m / dt_s) * 3.6 if dt_s > 0 else 0.0
+                t_sec = (
+                    (t2_us - t0) / US_TO_S
+                    if t0 is not None
+                    else float(i)
+                )
+            else:
+                spd_kmh = 0.0
+                t_sec = float(i)
+
+            elapsed_s.append(t_sec)
+            speed_kmh.append(max(0.0, spd_kmh))
+
+        return elapsed_s, speed_kmh
+
+    # ------------------------------------------------------------------
+    # Generación de todas las gráficas
+    # ------------------------------------------------------------------
+
+    def generate_all_plots(self):
+        """Ejecuta todas las gráficas disponibles en orden.
+
+        Cada gráfica se ejecuta en un bloque ``try/except`` para que
+        un fallo en una no impida el resto.
+        """
+        print(f"\n{SEPARATOR}")
+        print("Generando todas las gráficas...")
+        print(f"{SEPARATOR}\n")
+
+        graficas = [
+            ('actitud', self.visualize_attitude),
+            ('altitud', self.visualize_altitude),
+            ('altitud sobre terreno', self.visualize_altitude_terrain),
+            ('GPS', self.visualize_gps),
+            ('motores', self.visualize_motors),
+            ('IMU', self.visualize_imu),
+            ('batería', self.visualize_battery),
+            ('velocidad', self.visualize_speed),
+        ]
+
+        for nombre, metodo in graficas:
+            try:
+                metodo()
+            except Exception as exc:
+                print(f"Error en {nombre}: {exc}")
+
+        print("\n✓ Visualización completada")
+
+
+# ---------------------------------------------------------------------------
+# Comparativa entre ciudades
+# ---------------------------------------------------------------------------
+
+# Colores fijos por ciudad para consistencia en todas las gráficas
+CITY_COLORS = {
+    'coruna': '#1f77b4',    # azul
+    'santiago': '#ff7f0e',  # naranja
+    'vigo': '#2ca02c',      # verde
+}
+
+# Metros por grado de latitud (aproximación esférica)
+LAT_TO_M = 111_320.0
+
+
+def _normalize_to_percent(values, n_points=100):
+    """Remuestrea una serie a ``n_points`` puntos equiespaciados (0-100 %).
+
+    Permite comparar series de distinta longitud sobre el mismo eje X
+    que representa el porcentaje de progreso del vuelo.
+
+    Parámetros:
+        values (list[float]): Serie original de cualquier longitud.
+        n_points (int): Número de puntos de la serie de salida.
+
+    Devuelve:
+        list[float]: Serie interpolada linealmente de ``n_points`` valores.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [values[0]] * n_points
+
+    result = []
+    for i in range(n_points):
+        idx_f = i * (n - 1) / (n_points - 1)
+        idx_lo = int(idx_f)
+        idx_hi = min(idx_lo + 1, n - 1)
+        frac = idx_f - idx_lo
+        result.append(values[idx_lo] * (1 - frac) + values[idx_hi] * frac)
+    return result
+
+
+def _save_comparison_figure(fig, base_filename):
+    """Guarda una figura de comparativa en la carpeta comparativas.
+
+    Parámetros:
+        fig: Objeto figura de matplotlib.
+        base_filename (str): Nombre base sin extensión, p.ej.
+            'velocidad_comparativa'.
+    """
+    COMPARISON_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{base_filename}.png"
+    filepath = COMPARISON_OUTPUT_DIR / filename
+    try:
+        fig.savefig(filepath, dpi=100, bbox_inches='tight')
+        print(f"  ✓ Comparativa guardada: {filepath.name}")
+    except Exception as exc:
+        print(f"  ✗ Error guardando {filename}: {exc}")
+
+
+def _load_all_visualizers():
+    """Carga los tres logs y devuelve un diccionario clave → visualizador.
+
+    Solo incluye las ciudades cuyos archivos existen en disco.
+
+    Devuelve:
+        dict[str, MissionPlannerVisualizer]: Visualizadores ya cargados.
+    """
+    visualizers = {}
+    for key in CITY_ORDER:
+        log_path = CITY_LOG_FILES[key]
+        label = CITY_LABELS[key]
+        if not Path(log_path).exists():
+            print(f"⚠ No se encontró el log de {label}: {log_path}")
+            continue
+        try:
+            viz = MissionPlannerVisualizer(log_path, label, city_key=key)
+            viz.read_log()
+            visualizers[key] = viz
+            print(f"✓ {label} cargada")
+        except Exception as exc:
+            print(f"⚠ Error cargando {label}: {exc}")
+    return visualizers
+
+
+def compare_speed(visualizers):
+    """Superpone los perfiles de velocidad suavizada de las tres ciudades.
+
+    Normaliza el tiempo de cada vuelo a 0-100 % para que las curvas
+    sean comparables con independencia de la duración total del vuelo.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    x = list(range(100))
+
+    plt.figure(figsize=(13, 6))
+    plotted = False
+
+    for key in CITY_ORDER:
+        if key not in visualizers:
+            continue
+        _, speed_kmh = visualizers[key]._compute_speed_series()
+        if len(speed_kmh) < 2:
+            continue
+        smooth = MissionPlannerVisualizer._moving_average(
+            speed_kmh, window=SMOOTHING_WINDOW
+        )
+        plt.plot(
+            x, _normalize_to_percent(smooth),
+            linewidth=2.5,
+            label=CITY_LABELS[key],
+            color=CITY_COLORS[key],
+        )
+        plotted = True
+
+    if not plotted:
+        print("⚠ No hay datos de velocidad para comparar")
+        return
+
+    plt.xlabel('Progreso del vuelo (%)')
+    plt.ylabel('Velocidad (km/h)')
+    plt.title('Comparativa de Velocidad — A Coruña · Santiago · Vigo')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_comparison_figure(plt.gcf(), 'velocidad_comparativa')
+    plt.show()
+
+
+def compare_altitude(visualizers):
+    """Superpone los perfiles de altitud barométrica de las tres ciudades.
+
+    El eje X representa el progreso del vuelo (0-100 %) para que la
+    comparación sea independiente de la duración de cada misión.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    x = list(range(100))
+
+    plt.figure(figsize=(13, 6))
+    plotted = False
+
+    for key in CITY_ORDER:
+        if key not in visualizers:
+            continue
+        series = visualizers[key]._extract_series('BARO', ('Alt',))
+        if series is None or not series['Alt']:
+            continue
+        plt.plot(
+            x, _normalize_to_percent(series['Alt']),
+            linewidth=2.5,
+            label=CITY_LABELS[key],
+            color=CITY_COLORS[key],
+        )
+        plotted = True
+
+    if not plotted:
+        print("⚠ No hay datos de altitud para comparar")
+        return
+
+    plt.xlabel('Progreso del vuelo (%)')
+    plt.ylabel('Altitud (m)')
+    plt.title('Comparativa de Altitud Barométrica — A Coruña · Santiago · Vigo')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_comparison_figure(plt.gcf(), 'altitud_comparativa')
+    plt.show()
+
+
+def compare_altitude_vs_distance(visualizers):
+    """Grafica el perfil de altitud en función de la distancia acumulada.
+
+    El eje X representa kilómetros recorridos desde el despegue, lo que
+    permite comparar cómo varía la altitud a lo largo de cada ruta
+    independientemente del tiempo de vuelo.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    plt.figure(figsize=(13, 6))
+    plotted = False
+
+    for key in CITY_ORDER:
+        if key not in visualizers:
+            continue
+        viz = visualizers[key]
+        points = viz._get_valid_gps_points()
+        if len(points) < 2:
+            continue
+
+        # Distancia acumulada entre puntos GPS consecutivos (km)
+        dist_km = [0.0]
+        for i in range(1, len(points)):
+            d_m = MissionPlannerVisualizer._haversine_m(
+                points[i - 1][0], points[i - 1][1],
+                points[i][0], points[i][1],
+            )
+            dist_km.append(dist_km[-1] + d_m / 1000.0)
+
+        # Altitud barométrica normalizada a la misma cantidad de puntos
+        baro = viz._extract_series('BARO', ('Alt',))
+        if baro is None or len(baro['Alt']) < 2:
+            continue
+
+        n = len(dist_km)
+        alt_norm = _normalize_to_percent(baro['Alt'], n_points=n)
+
+        plt.plot(
+            dist_km, alt_norm,
+            linewidth=2.5,
+            label=CITY_LABELS[key],
+            color=CITY_COLORS[key],
+        )
+        plotted = True
+
+    if not plotted:
+        print("⚠ No hay datos suficientes para comparar altitud vs distancia")
+        return
+
+    plt.xlabel('Distancia recorrida (km)')
+    plt.ylabel('Altitud (m)')
+    plt.title(
+        'Perfil de Altitud vs Distancia — A Coruña · Santiago · Vigo'
+    )
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_comparison_figure(plt.gcf(), 'altitud_vs_distancia')
+    plt.show()
+
+
+def compare_gps_tracks(visualizers):
+    """Superpone las trayectorias GPS centradas en el punto de despegue.
+
+    Convierte las coordenadas geográficas de cada ciudad a metros de
+    desplazamiento relativo respecto al primer punto (origen = (0, 0))
+    para poder representar todas las rutas en la misma escala aunque
+    se encuentren en lugares geográficos distintos.
+
+    Los marcadores circulares indican el inicio y los cuadrados el final.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    plt.figure(figsize=(10, 9))
+    plotted = False
+
+    for key in CITY_ORDER:
+        if key not in visualizers:
+            continue
+        points = visualizers[key]._get_valid_gps_points()
+        if len(points) < 2:
+            continue
+
+        lat0, lon0, _ = points[0]
+        # Factor de escala longitud → metros según la latitud del origen
+        lon_to_m = LAT_TO_M * math.cos(math.radians(lat0))
+
+        x_m = [(p[1] - lon0) * lon_to_m for p in points]
+        y_m = [(p[0] - lat0) * LAT_TO_M for p in points]
+
+        color = CITY_COLORS[key]
+        plt.plot(x_m, y_m, linewidth=1.8, label=CITY_LABELS[key], color=color)
+        # Punto de inicio (círculo) y fin (cuadrado)
+        plt.scatter([x_m[0]], [y_m[0]], color=color, s=90,
+                    marker='o', zorder=5)
+        plt.scatter([x_m[-1]], [y_m[-1]], color=color, s=90,
+                    marker='s', zorder=5)
+        plotted = True
+
+    if not plotted:
+        print("⚠ No hay datos GPS suficientes para comparar")
+        return
+
+    plt.xlabel('Desplazamiento Este-Oeste (m)')
+    plt.ylabel('Desplazamiento Norte-Sur (m)')
+    plt.title(
+        'Trayectorias GPS Centradas en el Origen'
+        ' — A Coruña · Santiago · Vigo'
+    )
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.axis('equal')
+    plt.tight_layout()
+    _save_comparison_figure(plt.gcf(), 'gps_comparativa')
+    plt.show()
+
+
+def compare_metrics_dashboard(visualizers):
+    """Dashboard de barras con las métricas clave de cada ciudad.
+
+    Muestra en una sola figura 5 subgráficas de barras:
+    - Distancia total (km)
+    - Duración del vuelo (min)
+    - Velocidad media (km/h)
+    - Altitud máxima (m)
+    - Voltaje mínimo de batería (V)
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    keys = [k for k in CITY_ORDER if k in visualizers]
+    labels = [CITY_LABELS[k] for k in keys]
+    bar_colors = [CITY_COLORS[k] for k in keys]
+
+    dist_km = []
+    dur_min = []
+    vel_media_kmh = []
+    alt_max_m = []
+    bat_min_v = []
+
+    for key in keys:
+        viz = visualizers[key]
+
+        # --- Distancia y duración ---
+        points = viz._get_valid_gps_points()
+        if len(points) >= 2:
+            total_m = sum(
+                MissionPlannerVisualizer._haversine_m(
+                    points[i - 1][0], points[i - 1][1],
+                    points[i][0], points[i][1],
+                )
+                for i in range(1, len(points))
+            )
+            times = [p[2] for p in points if p[2] is not None]
+            total_s = (
+                max(0.0, (times[-1] - times[0]) / US_TO_S)
+                if len(times) >= 2 else 0.0
+            )
+        else:
+            total_m = total_s = 0.0
+
+        dist_km.append(total_m / 1000.0)
+        dur_min.append(total_s / 60.0)
+        vel_media_kmh.append(
+            (total_m / total_s * 3.6) if total_s > 0 else 0.0
+        )
+
+        # --- Altitud máxima ---
+        baro = viz._extract_series('BARO', ('Alt',))
+        alt_max_m.append(max(baro['Alt']) if baro and baro['Alt'] else 0.0)
+
+        # --- Voltaje mínimo de batería ---
+        bat = viz._extract_series('BAT', ('Volt',))
+        if bat:
+            volts = [v for v in bat['Volt'] if BAT_VOLT_MIN < v <= BAT_VOLT_MAX]
+            bat_min_v.append(min(volts) if volts else 0.0)
+        else:
+            bat_min_v.append(0.0)
+
+    # Datos agrupados: (valores, título del panel, unidad, formato de número)
+    metricas = [
+        (dist_km,       'Distancia total',         'km',   '{:.2f} km'),
+        (dur_min,       'Duración del vuelo',       'min',  '{:.1f} min'),
+        (vel_media_kmh, 'Velocidad media',          'km/h', '{:.1f} km/h'),
+        (alt_max_m,     'Altitud máxima',           'm',    '{:.0f} m'),
+        (bat_min_v,     'Voltaje mínimo batería',   'V',    '{:.2f} V'),
+    ]
+
+    # Rejilla 2×3: 5 paneles de barras + 1 panel de resumen textual
+    # constrained_layout evita recortes del título y solapes entre paneles.
+    fig, axes = plt.subplots(2, 3, figsize=(22, 11), constrained_layout=True)
+    fig.patch.set_facecolor('#f0f2f5')
+    fig.suptitle(
+        'Dashboard Comparativo — A Coruña · Santiago · Vigo',
+        fontsize=16, fontweight='bold',
+    )
+
+    ax_flat = axes.flatten()
+
+    for idx, (values, title, xlabel, fmt) in enumerate(metricas):
+        ax = ax_flat[idx]
+        ax.set_facecolor('#ffffff')
+
+        # Invertir para que la primera ciudad aparezca arriba
+        inv_labels = list(reversed(labels))
+        inv_values = list(reversed(values))
+        inv_colors = list(reversed(bar_colors))
+
+        max_val = max(inv_values) if inv_values else 1.0
+
+        bars = ax.barh(
+            inv_labels, inv_values,
+            color=inv_colors,
+            edgecolor='white',
+            linewidth=1.0,
+            height=0.55,
+        )
+
+        # Valor a la derecha de cada barra
+        for bar, val in zip(bars, inv_values):
+            bar_w = bar.get_width()
+            offset = max_val * 0.02
+            # Texto dentro si hay espacio, fuera si la barra es corta
+            if bar_w > max_val * 0.25:
+                ax.text(
+                    bar_w - offset,
+                    bar.get_y() + bar.get_height() / 2,
+                    fmt.format(val),
+                    ha='right', va='center',
+                    fontsize=10, fontweight='bold', color='white',
+                )
+            else:
+                ax.text(
+                    bar_w + offset,
+                    bar.get_y() + bar.get_height() / 2,
+                    fmt.format(val),
+                    ha='left', va='center',
+                    fontsize=10, fontweight='bold', color='#333333',
+                )
+
+        ax.set_title(title, fontsize=11, fontweight='bold', pad=6)
+        ax.set_xlabel(xlabel, fontsize=9, color='#555555')
+        ax.set_xlim(0, max_val * 1.30)
+        ax.tick_params(axis='y', labelsize=9)
+        ax.tick_params(axis='x', labelsize=8)
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.grid(axis='x', alpha=0.25, linestyle='--')
+
+    # --- Panel de resumen textual (celda [1,2]) ---
+    ax_sum = ax_flat[5]
+    ax_sum.set_facecolor('#ffffff')
+    ax_sum.axis('off')
+    ax_sum.margins(0.1)  # Añade margen interno al panel
+
+    # Cabecera compacta para evitar solapes de texto en columnas estrechas
+    col_headers = ['Ciudad', 'Dist', 'Dur', 'Vel', 'Alt', 'Bat']
+
+    def _city_label_for_table(city_key):
+        """Devuelve un nombre compacto para que no se solape la fila."""
+        if city_key == 'santiago':
+            return 'Santiago'
+        return CITY_LABELS[city_key]
+
+    rows = []
+    for i, key in enumerate(keys):
+        rows.append([
+            _city_label_for_table(key),
+            f'{dist_km[i]:.2f}',
+            f'{dur_min[i]:.1f}',
+            f'{vel_media_kmh[i]:.1f}',
+            f'{alt_max_m[i]:.0f}',
+            f'{bat_min_v[i]:.2f}',
+        ])
+
+    table = ax_sum.table(
+        cellText=rows,
+        colLabels=col_headers,
+        cellLoc='center',
+        bbox=[0.00, 0.08, 1.00, 0.84],  # Máximo ancho total para todas las columnas
+        colWidths=[0.25, 0.19, 0.14, 0.18, 0.10, 0.14],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(11.5)
+    table.scale(1.70, 2.05)
+
+    # Color de cabecera oscuro, filas con color de ciudad
+    for (row, col), cell in table.get_celld().items():
+        cell.PAD = 0.13
+        cell.set_edgecolor('#bbbbbb')
+        cell.set_linewidth(0.5)
+        if row == 0:
+            cell.set_facecolor('#2a2a2a')
+            cell.set_text_props(color='white', fontweight='bold', fontsize=12)
+        elif row <= len(keys):
+            city_key = keys[row - 1]
+            r, g, b = plt.matplotlib.colors.to_rgb(CITY_COLORS[city_key])
+            cell.set_facecolor((r, g, b, 0.12))
+
+        # Primera columna alineada a la izquierda para mejor legibilidad.
+        if col == 0 and row > 0:
+            cell.get_text().set_ha('left')
+
+    ax_sum.set_title('Resumen', fontsize=10, fontweight='bold', pad=8)
+
+    # Reserva espacio con márgenes internos suficientes.
+    fig.set_constrained_layout_pads(h_pad=0.05, w_pad=0.05, hspace=0.05,
+                                    wspace=0.05)
+    _save_comparison_figure(fig, 'dashboard_metricas')
+    plt.show()
+
+
+def compare_battery(visualizers):
+    """Superpone el perfil de voltaje de batería de las tres ciudades.
+
+    El eje X representa el progreso del vuelo (0-100 %) para que la
+    comparación sea independiente de la duración de cada misión.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    x = list(range(100))
+
+    plt.figure(figsize=(13, 6))
+    plotted = False
+
+    for key in CITY_ORDER:
+        if key not in visualizers:
+            continue
+        bat = visualizers[key]._extract_series('BAT', ('Volt',))
+        if bat is None:
+            continue
+        volts = [v for v in bat['Volt'] if BAT_VOLT_MIN < v <= BAT_VOLT_MAX]
+        if len(volts) < 2:
+            continue
+        plt.plot(
+            x, _normalize_to_percent(volts),
+            linewidth=2.5,
+            label=CITY_LABELS[key],
+            color=CITY_COLORS[key],
+        )
+        plotted = True
+
+    if not plotted:
+        print("⚠ No hay datos de batería para comparar")
+        return
+
+    plt.xlabel('Progreso del vuelo (%)')
+    plt.ylabel('Voltaje (V)')
+    plt.title(
+        'Comparativa de Voltaje de Batería — A Coruña · Santiago · Vigo'
+    )
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    _save_comparison_figure(plt.gcf(), 'bateria_comparativa')
+    plt.show()
+
+
+def _run_comparison_session(visualizers):
+    """Menú interactivo de gráficas comparativas entre las tres ciudades.
+
+    Parámetros:
+        visualizers (dict): Visualizadores cargados por clave de ciudad.
+    """
+    print("\nGráficas comparativas disponibles:")
+    opciones_comp = [
+        ("1", "Velocidad normalizada (progreso del vuelo %)"),
+        ("2", "Altitud barométrica normalizada (progreso del vuelo %)"),
+        ("3", "Perfil de altitud vs distancia recorrida"),
+        ("4", "Trayectorias GPS centradas en el origen"),
+        ("5", "Dashboard de métricas (distancia, tiempo, vel. media…)"),
+        ("6", "Voltaje de batería normalizado"),
+        ("7", "Todas las comparativas"),
+        ("0", "Omitir"),
+    ]
+    for num, desc in opciones_comp:
+        print(f"  {num}. {desc}")
+
+    eleccion = input(
+        "\nSelecciona opción(es) (0-7), "
+        "separadas por coma, p.ej. 1,3,5: "
+    ).strip()
+
+    if not eleccion:
+        return
+
+    seleccionadas = [c.strip() for c in eleccion.split(',') if c.strip()]
+
+    if '0' in seleccionadas:
+        return
+
+    acciones_comp = {
+        '1': lambda: compare_speed(visualizers),
+        '2': lambda: compare_altitude(visualizers),
+        '3': lambda: compare_altitude_vs_distance(visualizers),
+        '4': lambda: compare_gps_tracks(visualizers),
+        '5': lambda: compare_metrics_dashboard(visualizers),
+        '6': lambda: compare_battery(visualizers),
+    }
+
+    todas = [
+        '1', '2', '3', '4', '5', '6',
+    ]
+
+    if '7' in seleccionadas:
+        seleccionadas = todas
+
+    for opt in seleccionadas:
+        accion = acciones_comp.get(opt)
+        if accion is None:
+            print(f"Opción no válida: {opt}")
+            continue
+        try:
+            accion()
+        except Exception as exc:
+            print(f"Error en comparativa {opt}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
+
+def _print_pending_cities(city_order, city_labels, used_cities):
+    """Imprime el menú de ciudades indicando cuáles ya se han ejecutado.
+
+    Parámetros:
+        city_order (list[str]): Claves de ciudad en orden de presentación.
+        city_labels (dict[str, str]): Nombre completo por clave.
+        used_cities (set[str]): Ciudades ya procesadas.
+    """
+    print("Ciudades pendientes:")
+    for idx, key in enumerate(city_order, 1):
+        estado = " (ya ejecutada)" if key in used_cities else ""
+        print(f"  {idx}. {city_labels[key]}{estado}")
+    print("  0. Salir")
+
+
+def _run_city_session(visualizer):
+    """Muestra el menú de gráficas y ejecuta las seleccionadas.
+
+    Parámetros:
+        visualizer (MissionPlannerVisualizer): Instancia ya cargada
+            con el log de la ciudad correspondiente.
+    """
+    print("\nOpciones disponibles:")
+    opciones = [
+        ("1", "Actitud (Roll, Pitch, Yaw)"),
+        ("2", "Altitud"),
+        ("3", "GPS"),
+        ("4", "Motores"),
+        ("5", "IMU"),
+        ("6", "Batería"),
+        ("7", "Altitud sobre terreno (AGL)"),
+        ("8", "Velocidad"),
+        ("9", "Todas las gráficas"),
+        ("0", "Omitir esta ciudad"),
+    ]
+    for num, desc in opciones:
+        print(f"  {num}. {desc}")
+
+    eleccion = input(
+        "\nSelecciona opción(es) (0-9). "
+        "Puedes poner varias separadas por coma, p.ej. 1,2,7: "
+    ).strip()
+
+    if not eleccion:
+        print("No se seleccionó ninguna opción")
+        return
+
+    seleccionadas = [c.strip() for c in eleccion.split(',') if c.strip()]
+
+    if '0' in seleccionadas:
+        print("Ciudad omitida (sin gráficas).")
+        return
+
+    if '9' in seleccionadas:
+        visualizer.generate_all_plots()
+        return
+
+    acciones = {
+        '1': visualizer.visualize_attitude,
+        '2': visualizer.visualize_altitude,
+        '3': visualizer.visualize_gps,
+        '4': visualizer.visualize_motors,
+        '5': visualizer.visualize_imu,
+        '6': visualizer.visualize_battery,
+        '7': visualizer.visualize_altitude_terrain,
+        '8': visualizer.visualize_speed,
+    }
+
+    ejecutadas = 0
+    for opt in seleccionadas:
+        accion = acciones.get(opt)
+        if accion is None:
+            print(f"Opción no válida: {opt}")
+            continue
+        print(f"\nEjecutando opción {opt}...")
+        accion()
+        ejecutadas += 1
+
+    if ejecutadas == 0:
+        print("No se ejecutó ninguna opción válida")
+
+
+def main():
+    """Punto de entrada del programa.
+
+    Muestra un menú interactivo para seleccionar ciudad, carga el log
+    correspondiente, imprime el resumen de ruta y lanza las gráficas
+    elegidas.  El bucle termina cuando se han procesado las tres ciudades
+    o el usuario elige salir.
+    """
+    print(SEPARATOR)
+    print("VISUALIZADOR DE LOGS DE MISSION PLANNER - OCTOROTOR")
+    print(SEPARATOR + "\n")
+
+    used_cities = set()
+
+    while len(used_cities) < len(CITY_ORDER):
+        _print_pending_cities(CITY_ORDER, CITY_LABELS, used_cities)
+
+        eleccion = input("\nSelecciona ciudad (1-3 o nombre): ").strip().lower()
+
+        if eleccion == '0':
+            print("Saliendo...")
+            return
+
+        city_key = CITY_ALIASES.get(eleccion)
+        if city_key is None:
+            print("Ciudad no válida. Elige A Coruña, Santiago o Vigo.")
+            continue
+
+        if city_key in used_cities:
+            print("Esa ciudad ya se ejecutó. Elige otra.")
+            continue
+
+        log_path = CITY_LOG_FILES[city_key]
+        city_label = CITY_LABELS[city_key]
+
+        if not Path(log_path).exists():
+            print(f"No se encontró el log para {city_label}: {log_path}")
+            used_cities.add(city_key)
+            continue
+
+        print(f"\nCiudad seleccionada: {city_label}")
+        print(f"Archivo de log     : {log_path}")
+
+        try:
+            visualizer = MissionPlannerVisualizer(log_path, city_label,
+                                                 city_key=city_key)
+            visualizer.read_log()
+            visualizer.report_route_metrics()
+            _run_city_session(visualizer)
+
+        except Exception as exc:
+            import traceback
+            print(f"Error procesando {city_label}: {exc}")
+            traceback.print_exc()
+
+        finally:
+            used_cities.add(city_key)
+            restantes = len(CITY_ORDER) - len(used_cities)
+            if restantes > 0:
+                print(
+                    f"\nCiudad completada. "
+                    f"Quedan {restantes} ciudad(es) por ejecutar.\n"
+                )
+    print("\n✅ Ya se ejecutaron las tres ciudades.")
+
+    # Ofrecer gráficas comparativas entre las tres ciudades
+    resp = input(
+        "\n¿Generar gráficas comparativas de las tres ciudades? (s/n): "
+    ).strip().lower()
+    if resp in ('s', 'si', 'sí', 'y', 'yes'):
+        print("\nCargando los tres logs para comparación...")
+        vizs = _load_all_visualizers()
+        if len(vizs) >= 2:
+            _run_comparison_session(vizs)
+        else:
+            print("⚠ Se necesitan al menos 2 ciudades para comparar")
+
+    print("\nFin del programa.")
+
+
+if __name__ == "__main__":
+    main()
