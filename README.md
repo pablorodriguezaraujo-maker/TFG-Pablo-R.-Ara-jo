@@ -1,1 +1,4 @@
 Código en Python con las optimizaciones de las rutas de vuelo, las optimizaciones de las alturas de vuelo y las gráficas obtenidas de las simulaciones en Mission Planner.
+Para ejecutar correctamente el código de Rutas de vuelo se necesitan descargar los siguientes archivos: elevacion coruna.tif, elevacion santiago.tif, elevacion vigo.tif, poblacion coruña.tif, poblacion santiago.tif, y poblacion vigo.tif.
+Para ejecutar correctamente el código de Alturas de vuelo se necesitan descargar los siguientes archivos: elevacion coruna.tif, elevacion santiago.tif, elevacion vigo.tif, poblacion coruña.tif, poblacion santiago.tif, poblacion vigo.tif y alturas_edificios_2018.tif.
+Para ejecutar correctamente el código de Gráficas de Mission Planner se necesitan descargar los siguientes archivos: 2026-05-11 14-06-01.bin, 2026-05-12 02-37-24 y 2026-05-12 02-46-51.bin.
