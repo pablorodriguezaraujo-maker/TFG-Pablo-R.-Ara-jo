@@ -12,6 +12,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DOWNLOADS_DIR = Path.home() / "Downloads"
 
 
 def configure_utf8_output():
@@ -88,24 +89,24 @@ SAVE_ANIMATIONS = True
 CITY_CONFIG = {
     "coruna": {
         "label": "Coruña",
-        "obstacle_raster": resource_path("poblaciones/poblacion coruña.tif"),
-        "elevation_raster": resource_path("elevaciones/elevacion coruna.tif"),
+        "obstacle_raster": DOWNLOADS_DIR / "poblacion coruña.tif",
+        "elevation_raster": DOWNLOADS_DIR / "elevacion coruna.tif",
         "start_latlon": (43.3044, -8.3775904),
         "end_latlon": (43.3446688, -8.3889104),
         "waypoint_count": 6,
     },
     "santiago": {
         "label": "Santiago",
-        "obstacle_raster": resource_path("poblaciones/poblacion santiago.tif"),
-        "elevation_raster": resource_path("elevaciones/elevacion santiago.tif"),
+        "obstacle_raster": DOWNLOADS_DIR / "poblacion santiago.tif",
+        "elevation_raster": DOWNLOADS_DIR / "elevacion santiago.tif",
         "start_latlon": (42.89285, -8.42089),
         "end_latlon": (42.86841, -8.56752),
         "waypoint_count": 14,
     },
     "vigo": {
         "label": "Vigo",
-        "obstacle_raster": resource_path("poblaciones/poblacion vigo.tif"),
-        "elevation_raster": resource_path("elevaciones/elevacion vigo.tif"),
+        "obstacle_raster": DOWNLOADS_DIR / "poblacion vigo.tif",
+        "elevation_raster": DOWNLOADS_DIR / "elevacion vigo.tif",
         "start_latlon": (42.22216, -8.63212),
         "end_latlon": (42.1879648, -8.7139768),
         "waypoint_count": 9,
