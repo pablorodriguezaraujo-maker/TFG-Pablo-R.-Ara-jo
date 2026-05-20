@@ -64,20 +64,14 @@ BAT_CURR_MAX = 500.0
 # Separador visual para la consola
 SEPARATOR = "=" * 60
 
-# Rutas de log por ciudad
+# Carpeta Descargas del usuario actual
+DOWNLOADS_DIR = Path.home() / 'Downloads'
+
+# Rutas de log por ciudad (tres archivos .bin individuales en Descargas)
 CITY_LOG_FILES = {
-    'coruna': (
-        r"C:\Users\pablo\Documents\Mission Planner\logs"
-        r"\OCTOROTOR\1\2026-05-12 02-37-24.bin"
-    ),
-    'santiago': (
-        r"C:\Users\pablo\Documents\Mission Planner\logs"
-        r"\OCTOROTOR\1\2026-05-12 02-46-51.bin"
-    ),
-    'vigo': (
-        r"C:\Users\pablo\Documents\Mission Planner\logs"
-        r"\OCTOROTOR\1\2026-05-11 14-06-01.bin"
-    ),
+    'coruna': DOWNLOADS_DIR / '2026-05-12 02-37-24.bin',
+    'santiago': DOWNLOADS_DIR / '2026-05-12 02-46-51.bin',
+    'vigo': DOWNLOADS_DIR / '2026-05-11 14-06-01.bin',
 }
 
 # Orden de presentación de ciudades en el menú
