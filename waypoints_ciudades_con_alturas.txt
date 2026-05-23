@@ -1,0 +1,68 @@
+================================================================================
+  PERFIL DE ALTURAS OPTIMIZADO PARA TRANSPORTE DE ORGANOS
+  Limite legal: 120 m AGL  |  Margen seguridad edificios: 25 m  |  Subida/bajada: 40% de la ruta
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+  CIUDAD: CORUÑA   |   Waypoints azules: 6   |   Crucero: 90,0 m AGL   |   Edificio max: 23,4 m (LIDAR MDS02-MDT02 max)
+────────────────────────────────────────────────────────────────────────────────
+TIPO         IDX    lat                    lon                    terreno        AGL            AMSL
+
+INICIO REAL  0      lat=43,30440000  lon=-8,37759040  terreno=76,7 m  AGL=50,0 m  AMSL=126,7 m  [despegue a 50,0 m AGL]
+
+  --- Waypoints azules (6 puntos) ---
+WAYPOINT     1      lat=43,30829527  lon=-8,36991372  terreno=73,0 m  AGL=60,0 m  AMSL=133,0 m
+WAYPOINT     2      lat=43,31543770  lon=-8,35964311  terreno=7,2 m  AGL=70,0 m  AMSL=77,2 m
+WAYPOINT     3      lat=43,32258012  lon=-8,36477841  terreno=20,0 m  AGL=80,0 m  AMSL=100,0 m
+WAYPOINT     4      lat=43,32615133  lon=-8,36477841  terreno=20,0 m  AGL=80,0 m  AMSL=100,0 m
+WAYPOINT     5      lat=43,32972254  lon=-8,37504903  terreno=16,6 m  AGL=70,0 m  AMSL=86,6 m
+WAYPOINT     6      lat=43,33686496  lon=-8,38018434  terreno=9,8 m  AGL=60,0 m  AMSL=69,8 m
+
+FIN REAL     7      lat=43,34466880  lon=-8,38891040  terreno=85,5 m  AGL=30,0 m  AMSL=115,5 m  [aterrizaje a 30,0 m AGL]
+
+────────────────────────────────────────────────────────────────────────────────
+  CIUDAD: SANTIAGO   |   Waypoints azules: 14   |   Crucero: 110,0 m AGL   |   Edificio max: 30,6 m (LIDAR MDS02-MDT02 max)
+────────────────────────────────────────────────────────────────────────────────
+TIPO         IDX    lat                    lon                    terreno        AGL            AMSL
+
+INICIO REAL  0      lat=42,89285000  lon=-8,42089000  terreno=368,3 m  AGL=60,0 m  AMSL=428,3 m  [despegue a 60,0 m AGL]
+
+  --- Waypoints azules (14 puntos) ---
+WAYPOINT     1      lat=42,90271297  lon=-8,43067594  terreno=332,9 m  AGL=68,0 m  AMSL=400,9 m
+WAYPOINT     2      lat=42,90952779  lon=-8,43926853  terreno=314,3 m  AGL=76,0 m  AMSL=390,3 m
+WAYPOINT     3      lat=42,91293520  lon=-8,45215742  terreno=314,4 m  AGL=84,0 m  AMSL=398,4 m
+WAYPOINT     4      lat=42,91634260  lon=-8,46075001  terreno=294,2 m  AGL=92,0 m  AMSL=386,2 m
+WAYPOINT     5      lat=42,90952779  lon=-8,47363890  terreno=313,8 m  AGL=100,0 m  AMSL=413,8 m
+WAYPOINT     6      lat=42,90952779  lon=-8,48652779  terreno=316,2 m  AGL=108,0 m  AMSL=424,2 m
+WAYPOINT     7      lat=42,90952779  lon=-8,49512038  terreno=318,5 m  AGL=110,0 m  AMSL=428,5 m
+WAYPOINT     8      lat=42,91634260  lon=-8,50800927  terreno=327,0 m  AGL=110,0 m  AMSL=437,0 m
+WAYPOINT     9      lat=42,91293520  lon=-8,51660186  terreno=342,4 m  AGL=108,0 m  AMSL=450,4 m
+WAYPOINT     10     lat=42,90271297  lon=-8,52949075  terreno=337,9 m  AGL=100,0 m  AMSL=437,9 m
+WAYPOINT     11     lat=42,89589816  lon=-8,54237964  terreno=332,3 m  AGL=92,0 m  AMSL=424,3 m
+WAYPOINT     12     lat=42,89249075  lon=-8,55097223  terreno=270,5 m  AGL=84,0 m  AMSL=354,5 m
+WAYPOINT     13     lat=42,88226853  lon=-8,55956483  terreno=233,1 m  AGL=76,0 m  AMSL=309,1 m
+WAYPOINT     14     lat=42,87545371  lon=-8,56386112  terreno=206,6 m  AGL=68,0 m  AMSL=274,6 m
+
+FIN REAL     15     lat=42,86841000  lon=-8,56752000  terreno=227,1 m  AGL=10,0 m  AMSL=237,1 m  [aterrizaje a 10,0 m AGL]
+
+────────────────────────────────────────────────────────────────────────────────
+  CIUDAD: VIGO   |   Waypoints azules: 9   |   Crucero: 90,0 m AGL   |   Edificio max: 10,7 m (LIDAR MDS02-MDT02 max)
+────────────────────────────────────────────────────────────────────────────────
+TIPO         IDX    lat                    lon                    terreno        AGL            AMSL
+
+INICIO REAL  0      lat=42,22216000  lon=-8,63212000  terreno=254,4 m  AGL=45,0 m  AMSL=299,4 m  [despegue a 45,0 m AGL]
+
+  --- Waypoints azules (9 puntos) ---
+WAYPOINT     1      lat=42,21481542  lon=-8,63923303  terreno=268,8 m  AGL=55,0 m  AMSL=323,8 m
+WAYPOINT     2      lat=42,20714336  lon=-8,65021532  terreno=257,8 m  AGL=65,0 m  AMSL=322,8 m
+WAYPOINT     3      lat=42,21097939  lon=-8,65570646  terreno=275,2 m  AGL=75,0 m  AMSL=350,2 m
+WAYPOINT     4      lat=42,20714336  lon=-8,66668875  terreno=286,4 m  AGL=85,0 m  AMSL=371,4 m
+WAYPOINT     5      lat=42,19947130  lon=-8,67217989  terreno=264,0 m  AGL=85,0 m  AMSL=349,0 m
+WAYPOINT     6      lat=42,19179924  lon=-8,67767104  terreno=251,1 m  AGL=75,0 m  AMSL=326,1 m
+WAYPOINT     7      lat=42,18796322  lon=-8,68865332  terreno=219,7 m  AGL=65,0 m  AMSL=284,7 m
+WAYPOINT     8      lat=42,18796322  lon=-8,69414447  terreno=237,1 m  AGL=55,0 m  AMSL=292,1 m
+WAYPOINT     9      lat=42,18029116  lon=-8,70512675  terreno=175,6 m  AGL=45,0 m  AMSL=220,6 m
+
+FIN REAL     10     lat=42,18796480  lon=-8,71397680  terreno=124,5 m  AGL=18,8 m  AMSL=143,3 m  [aterrizaje a 143,3 m AMSL = 18,8 m AGL sobre terreno]
+
+================================================================================

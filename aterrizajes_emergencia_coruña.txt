@@ -1,0 +1,5 @@
+Ciudad: Coruña
+Coordenadas de zonas de aterrizaje de emergencia (WGS84)
+
+Z1 | lat=43.31543770 | lon=-8.35450780 | celda=(26, 10) | dist_ruta=1 | elev_m=6.91 | score=9.972
+Z2 | lat=43.33329375 | lon=-8.35450780 | celda=(26, 15) | dist_ruta=2 | elev_m=89.79 | score=25.909

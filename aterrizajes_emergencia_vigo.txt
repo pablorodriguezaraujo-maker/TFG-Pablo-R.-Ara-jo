@@ -1,0 +1,5 @@
+Ciudad: Vigo
+Coordenadas de zonas de aterrizaje de emergencia (WGS84)
+
+Z1 | lat=42.19599498 | lon=-8.66594359
+Z2 | lat=42.18777720 | lon=-8.66847702

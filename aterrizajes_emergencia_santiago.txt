@@ -1,0 +1,5 @@
+Ciudad: Santiago
+Coordenadas de zonas de aterrizaje de emergencia (WGS84)
+
+Z1 | lat=42.90612038 | lon=-8.49512038 | celda=(20, 24) | dist_ruta=1 | elev_m=318.49 | score=6.099
+Z2 | lat=42.90952779 | lon=-8.51230557 | celda=(16, 25) | dist_ruta=1 | elev_m=345.42 | score=7.484
