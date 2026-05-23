@@ -221,6 +221,81 @@ class MissionPlannerVisualizer:
             for field in fields
         }
 
+    def _build_time_axis_seconds(self, msg_type):
+        """Construye eje temporal (s) relativo al primer timestamp válido.
+
+        Busca marcas temporales en este orden: ``TimeUS``, ``TimeMS``,
+        ``time_us``, ``time_ms`` y ``Time``. Si no encuentra ninguna,
+        devuelve un eje por índice de muestra.
+
+        Parámetros:
+            msg_type (str): Clave del tipo de mensaje en ``self.data``.
+
+        Devuelve:
+            list[float] | None: Tiempo en segundos para cada muestra,
+            o ``None`` si ``msg_type`` no existe.
+        """
+        if msg_type not in self.data:
+            return None
+
+        messages = self.data[msg_type]
+        if not messages:
+            return []
+
+        # (nombre_campo, factor_a_segundos)
+        time_fields = (
+            ('TimeUS', 1.0 / US_TO_S),
+            ('TimeMS', 1e-3),
+            ('time_us', 1.0 / US_TO_S),
+            ('time_ms', 1e-3),
+            ('Time', 1.0),
+        )
+
+        raw_times = []
+        scales = []
+        for msg in messages:
+            value = None
+            scale = None
+
+            for field_name, factor in time_fields:
+                if isinstance(msg, dict):
+                    candidate = msg.get(field_name)
+                else:
+                    candidate = getattr(msg, field_name, None)
+
+                if candidate is not None:
+                    try:
+                        value = float(candidate)
+                        scale = factor
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+            raw_times.append(value)
+            scales.append(scale)
+
+        valid_idx = next((i for i, t in enumerate(raw_times) if t is not None), None)
+        if valid_idx is None:
+            return [float(i) for i in range(len(messages))]
+
+        t0 = raw_times[valid_idx]
+        t_scale = scales[valid_idx]
+
+        elapsed_s = []
+        last_t = 0.0
+        for value in raw_times:
+            if value is None:
+                elapsed_s.append(last_t)
+                continue
+
+            t_sec = max(0.0, (value - t0) * t_scale)
+            if t_sec < last_t:
+                t_sec = last_t
+            elapsed_s.append(t_sec)
+            last_t = t_sec
+
+        return elapsed_s
+
     @staticmethod
     def _haversine_m(lat1, lon1, lat2, lon2):
         """Distancia en metros entre dos coordenadas geográficas.
@@ -686,7 +761,9 @@ class MissionPlannerVisualizer:
         """Grafica los datos del IMU: acelerómetro y giroscopio.
 
         Fuente de datos: campos ``AccX/Y/Z`` y ``GyrX/Y/Z`` de
-        mensajes ``IMU``.  Genera dos subgráficas en la misma figura.
+        mensajes ``IMU``. El eje X usa tiempo relativo en segundos
+        (basado en ``TimeUS``/``TimeMS``). Genera dos subgráficas en la
+        misma figura.
         """
         if 'IMU' not in self.data:
             print("⚠ Datos de IMU no encontrados")
@@ -695,30 +772,34 @@ class MissionPlannerVisualizer:
         imu = self._extract_series(
             'IMU', ('AccX', 'AccY', 'AccZ', 'GyrX', 'GyrY', 'GyrZ')
         )
+        t_s = self._build_time_axis_seconds('IMU')
 
         fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        fig.subplots_adjust(hspace=0.42)
 
         # --- Subgráfica superior: acelerómetro ---
-        axes[0].plot(imu['AccX'], label='AccX', linewidth=1, alpha=0.7)
-        axes[0].plot(imu['AccY'], label='AccY', linewidth=1, alpha=0.7)
-        axes[0].plot(imu['AccZ'], label='AccZ', linewidth=1, alpha=0.7)
+        axes[0].plot(t_s, imu['AccX'], label='AccX', linewidth=1, alpha=0.7)
+        axes[0].plot(t_s, imu['AccY'], label='AccY', linewidth=1, alpha=0.7)
+        axes[0].plot(t_s, imu['AccZ'], label='AccZ', linewidth=1, alpha=0.7)
+        axes[0].set_xlabel('Tiempo (s)', labelpad=2)
         axes[0].set_ylabel('Aceleración (m/s²)')
         axes[0].set_title(self._title_with_city('Acelerómetro del IMU'))
         axes[0].legend()
         axes[0].grid(True, alpha=0.3)
 
         # --- Subgráfica inferior: giroscopio ---
-        axes[1].plot(imu['GyrX'], label='GyrX', linewidth=1, alpha=0.7)
-        axes[1].plot(imu['GyrY'], label='GyrY', linewidth=1, alpha=0.7)
-        axes[1].plot(imu['GyrZ'], label='GyrZ', linewidth=1, alpha=0.7)
-        axes[1].set_xlabel('Tiempo (muestras)')
+        axes[1].plot(t_s, imu['GyrX'], label='GyrX', linewidth=1, alpha=0.7)
+        axes[1].plot(t_s, imu['GyrY'], label='GyrY', linewidth=1, alpha=0.7)
+        axes[1].plot(t_s, imu['GyrZ'], label='GyrZ', linewidth=1, alpha=0.7)
+        axes[1].set_xlabel('Tiempo (s)')
         axes[1].set_ylabel('Velocidad angular (rad/s)')
-        axes[1].set_title(self._title_with_city('Giroscopio del IMU'))
+        axes[1].set_title(self._title_with_city('Giroscopio del IMU'), pad=10)
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
 
         fig = plt.gcf()
         self._save_figure(fig, 'imu')
+        plt.show()
 
     def visualize_battery(self):
         """Grafica el voltaje y la corriente de la batería.
@@ -757,6 +838,7 @@ class MissionPlannerVisualizer:
 
         fig = plt.gcf()
         self._save_figure(fig, 'bateria')
+        plt.show()
 
     def visualize_speed(self):
         """Grafica la velocidad del dron a lo largo de la ruta.
