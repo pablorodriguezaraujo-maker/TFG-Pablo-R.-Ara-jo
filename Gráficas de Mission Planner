@@ -64,6 +64,48 @@ BAT_CURR_MAX = 500.0
 # Separador visual para la consola
 SEPARATOR = "=" * 60
 
+# Conversión de centímetros a pulgadas (matplotlib usa pulgadas)
+CM_TO_IN = 1.0 / 2.54
+
+# Parámetros de página Word (A4 vertical) y márgenes indicados por el usuario
+WORD_PAGE_WIDTH_CM = 21.0
+WORD_MARGIN_LEFT_CM = 3.5
+WORD_MARGIN_RIGHT_CM = 2.0
+WORD_INTER_PLOT_GAP_CM = 0.5
+
+# Ancho máximo por gráfica para poder colocar 2 en la misma fila
+CITY_PLOT_WIDTH_CM = (
+    WORD_PAGE_WIDTH_CM
+    - WORD_MARGIN_LEFT_CM
+    - WORD_MARGIN_RIGHT_CM
+    - WORD_INTER_PLOT_GAP_CM
+) / 2.0
+
+# Tamaños base de las gráficas de ciudad
+CITY_PLOT_WIDTH_IN = CITY_PLOT_WIDTH_CM * CM_TO_IN
+CITY_PLOT_HEIGHT_IN = 3.30
+CITY_PLOT_HEIGHT_TALL_IN = 4.10
+
+# DPI de exportación para PNG con tamaño físico estable en Word
+EXPORT_DPI = 300
+
+# Tamaño de figuras comparativas por paneles (2 arriba + 1 abajo centrada)
+COMPARISON_PANEL_WIDTH_IN = (
+    (WORD_PAGE_WIDTH_CM - WORD_MARGIN_LEFT_CM - WORD_MARGIN_RIGHT_CM)
+    * CM_TO_IN
+)
+COMPARISON_PANEL_HEIGHT_IN = 6.8
+COMPARISON_PANEL_TALL_HEIGHT_IN = 8.4
+
+# Fuente unificada para lectura en documento Word
+plt.rcParams.update({
+    'font.size': 11,
+    'axes.labelsize': 11,
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'legend.fontsize': 11,
+})
+
 # Carpeta Descargas del usuario actual
 DOWNLOADS_DIR = Path.home() / 'Downloads'
 
@@ -140,6 +182,17 @@ class MissionPlannerVisualizer:
     # Helpers internos
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _legend_below(ax, ncol=1, y=-0.20):
+        """Sitúa la leyenda debajo del eje alineada a la izquierda."""
+        ax.legend(
+            loc='upper left',
+            bbox_to_anchor=(0.0, y),
+            ncol=ncol,
+            frameon=False,
+            borderaxespad=0.0,
+        )
+
     def _title_with_city(self, base_title):
         """Devuelve ``base_title`` seguido del nombre de ciudad.
 
@@ -168,7 +221,8 @@ class MissionPlannerVisualizer:
         filename = f"{base_filename}.png"
         filepath = self.output_dir / filename
         try:
-            fig.savefig(filepath, dpi=100, bbox_inches='tight')
+            # Mantiene el tamaño físico de la figura sin recortes automáticos.
+            fig.savefig(filepath, dpi=EXPORT_DPI)
             print(f"  ✓ Guardada: {filepath.name}")
         except Exception as exc:
             print(f"  ✗ Error guardando {filename}: {exc}")
@@ -222,11 +276,10 @@ class MissionPlannerVisualizer:
         }
 
     def _build_time_axis_seconds(self, msg_type):
-        """Construye eje temporal (s) relativo al primer timestamp válido.
+        """Construye eje temporal (s) relativo al inicio del vuelo.
 
-        Busca marcas temporales en este orden: ``TimeUS``, ``TimeMS``,
-        ``time_us``, ``time_ms`` y ``Time``. Si no encuentra ninguna,
-        devuelve un eje por índice de muestra.
+        Delega en ``_build_time_axis_seconds_global`` para que todos los
+        tipos de mensaje compartan el mismo t=0 (primer TimeUS del log).
 
         Parámetros:
             msg_type (str): Clave del tipo de mensaje en ``self.data``.
@@ -235,10 +288,10 @@ class MissionPlannerVisualizer:
             list[float] | None: Tiempo en segundos para cada muestra,
             o ``None`` si ``msg_type`` no existe.
         """
-        if msg_type not in self.data:
-            return None
+        return self._build_time_axis_seconds_global(msg_type)
 
-        messages = self.data[msg_type]
+    def _build_time_axis_seconds_from_messages(self, messages):
+        """Construye eje temporal (s) a partir de una lista de mensajes."""
         if not messages:
             return []
 
@@ -295,6 +348,119 @@ class MissionPlannerVisualizer:
             last_t = t_sec
 
         return elapsed_s
+
+    def _get_global_t0_us(self):
+        """Devuelve el TimeUS mínimo de todo el log como referencia de t=0 global.
+
+        Itera los primeros mensajes de cada tipo para encontrar el timestamp
+        más antiguo del log completo, que corresponde al inicio real del vuelo.
+        """
+        t0 = None
+        for messages in self.data.values():
+            for msg in messages[:10]:
+                for field in ('TimeUS', 'time_us'):
+                    val = (
+                        msg.get(field) if isinstance(msg, dict)
+                        else getattr(msg, field, None)
+                    )
+                    if val is not None:
+                        try:
+                            v = float(val)
+                            if t0 is None or v < t0:
+                                t0 = v
+                        except (TypeError, ValueError):
+                            pass
+        return t0
+
+    def _build_time_axis_seconds_global(self, msg_type):
+        """Eje temporal (s) relativo al primer TimeUS del log completo.
+
+        A diferencia de ``_build_time_axis_seconds``, usa como t=0 el
+        timestamp más antiguo de todo el log, no el primero del tipo de
+        mensaje concreto.  Así la curva AGL empieza en el instante real
+        de inicio del vuelo y no muestra altura > 0 en t=0 cuando los
+        mensajes TERR se registran por primera vez estando ya en el aire.
+        """
+        if msg_type not in self.data:
+            return None
+        global_t0 = self._get_global_t0_us()
+        messages = self.data[msg_type]
+        if global_t0 is None:
+            return self._build_time_axis_seconds_from_messages(messages)
+        result = []
+        last_t = 0.0
+        for msg in messages:
+            t_us = (
+                msg.get('TimeUS') if isinstance(msg, dict)
+                else getattr(msg, 'TimeUS', None)
+            )
+            if t_us is None:
+                result.append(last_t)
+                continue
+            try:
+                t_s = max(0.0, (float(t_us) - global_t0) / US_TO_S)
+                if t_s < last_t:
+                    t_s = last_t
+                result.append(t_s)
+                last_t = t_s
+            except (TypeError, ValueError):
+                result.append(last_t)
+        return result
+
+    def _build_time_axis_from_messages_global(self, messages):
+        """Eje temporal (s) para una lista arbitraria de mensajes, con t=0 global.
+
+        Versi\u00f3n de ``_build_time_axis_seconds_global`` que acepta
+        directamente una lista de mensajes (útil cuando se combinan
+        varios tipos, p.ej. RCOU + RCO2 para motores).
+        """
+        global_t0 = self._get_global_t0_us()
+        if global_t0 is None:
+            return self._build_time_axis_seconds_from_messages(messages)
+        result = []
+        last_t = 0.0
+        for msg in messages:
+            t_us = (
+                msg.get('TimeUS') if isinstance(msg, dict)
+                else getattr(msg, 'TimeUS', None)
+            )
+            if t_us is None:
+                result.append(last_t)
+                continue
+            try:
+                t_s = max(0.0, (float(t_us) - global_t0) / US_TO_S)
+                if t_s < last_t:
+                    t_s = last_t
+                result.append(t_s)
+                last_t = t_s
+            except (TypeError, ValueError):
+                result.append(last_t)
+        return result
+
+    def _get_flight_start_s(self):
+        """Devuelve el tiempo (s, relativo a global t0) del inicio del vuelo.
+
+        Usa la misma lógica de detección que visualize_altitude_terrain:
+        busca el primer CHeight > 1.0 en TERR tras una fase estable en 0,
+        y retrocede 5 muestras para incluir el inicio de la subida.
+        Devuelve 0.0 si no hay datos TERR o la detección falla.
+        """
+        if 'TERR' not in self.data:
+            return 0.0
+        agl_raw = self._extract_series('TERR', ('CHeight',))['CHeight']
+        if not agl_raw:
+            return 0.0
+        t_raw = self._build_time_axis_seconds_global('TERR')
+        if not t_raw:
+            return 0.0
+        first_stable = next((i for i, h in enumerate(agl_raw) if h <= 0.1), 0)
+        first_flight = next(
+            (i for i, h in enumerate(agl_raw)
+             if i >= first_stable and h > 1.0),
+            first_stable,
+        )
+        trim = max(0, first_flight - 5)
+        return t_raw[trim]
 
     @staticmethod
     def _haversine_m(lat1, lon1, lat2, lon2):
@@ -570,19 +736,17 @@ class MissionPlannerVisualizer:
             return
 
         series = self._extract_series('ATT', ('Roll', 'Pitch', 'Yaw'))
+        t_s = self._build_time_axis_seconds_global('ATT')
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(series['Roll'], label='Roll', linewidth=2)
-        plt.plot(series['Pitch'], label='Pitch', linewidth=2)
-        plt.plot(series['Yaw'], label='Yaw', linewidth=2)
-        plt.xlabel('Tiempo (muestras)')
+        plt.figure(figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_IN))
+        plt.plot(t_s, series['Roll'], label='Roll', linewidth=2)
+        plt.plot(t_s, series['Pitch'], label='Pitch', linewidth=2)
+        plt.plot(t_s, series['Yaw'], label='Yaw', linewidth=2)
+        plt.xlabel('Tiempo (s)', labelpad=2)
         plt.ylabel('Ángulo (grados)')
-        plt.title(
-            self._title_with_city('Actitud del Octorotor (Roll, Pitch, Yaw)')
-        )
-        plt.legend()
+        self._legend_below(plt.gca(), ncol=3, y=-0.30)
         plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        plt.tight_layout(rect=(0.0, 0.20, 1.0, 1.0))
         self._save_figure(plt.gcf(), 'actitud')
         plt.show()
 
@@ -596,15 +760,15 @@ class MissionPlannerVisualizer:
             return
 
         altitude = self._extract_series('BARO', ('Alt',))['Alt']
+        t_s = self._build_time_axis_seconds_global('BARO')
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(altitude, label='Altitud', linewidth=2, color='green')
-        plt.xlabel('Tiempo (muestras)')
+        plt.figure(figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_IN))
+        plt.plot(t_s, altitude, label='Altitud', linewidth=2, color='green')
+        plt.xlabel('Tiempo (s)', labelpad=2)
         plt.ylabel('Altitud (metros)')
-        plt.title(self._title_with_city('Altitud del Octorotor'))
-        plt.legend()
+        self._legend_below(plt.gca(), ncol=1, y=-0.30)
         plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        plt.tight_layout(rect=(0.0, 0.20, 1.0, 1.0))
         self._save_figure(plt.gcf(), 'altitud')
         plt.show()
 
@@ -617,25 +781,56 @@ class MissionPlannerVisualizer:
             print("⚠ Datos de TERR (terreno) no encontrados")
             return
 
-        agl = self._extract_series('TERR', ('CHeight',))['CHeight']
+        agl_raw = self._extract_series('TERR', ('CHeight',))['CHeight']
 
-        if not agl or all(v == 0 for v in agl):
+        if not agl_raw or all(v == 0 for v in agl_raw):
             print("⚠ No hay valores válidos de altura sobre terreno (CHeight)")
             return
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(
+        # Elimina el artefacto de inicialización del firmware de terreno:
+        # algunos logs comienzan con CHeight != 0 antes de que el sistema
+        # se calibre.  Además recorta la larga fase en tierra previa al
+        # despegue para que la escala temporal de la gráfica sea útil.
+        first_stable = next((i for i, h in enumerate(agl_raw) if h <= 0.1), 0)
+        first_flight = next(
+            (i for i, h in enumerate(agl_raw)
+             if i >= first_stable and h > 1.0),
+            first_stable,
+        )
+        trim = max(0, first_flight - 5)
+        t_raw = (
+            self._build_time_axis_seconds_global('TERR')
+            or list(range(len(agl_raw)))
+        )
+        agl = agl_raw[trim:]
+        x = t_raw[trim:]
+
+        if not agl or all(v == 0 for v in agl):
+            print("⚠ No hay valores de vuelo válidos de altura sobre terreno")
+            return
+
+        plt.figure(figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_IN))
+        # Rellena el área entre el terreno (0) y la altura AGL.
+        plt.fill_between(
+            x,
+            0,
             agl,
-            label='Altura sobre terreno (AGL)',
+            color='#c49a6c',
+            alpha=0.35,
+            label='Terreno',
+        )
+        plt.plot(
+            x,
+            agl,
+            label='Altura sobre terreno\n(AGL)',
             linewidth=2,
             color='orange',
         )
-        plt.xlabel('Tiempo (muestras)')
+        plt.xlabel('Tiempo (s)', labelpad=2)
         plt.ylabel('Altura sobre terreno (m)')
-        plt.title(self._title_with_city('Altitud respecto al terreno (AGL)'))
-        plt.legend()
+        self._legend_below(plt.gca(), ncol=2, y=-0.36)
         plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        plt.tight_layout(rect=(0.0, 0.22, 1.0, 1.0))
         self._save_figure(plt.gcf(), 'altitud_terreno')
         plt.show()
 
@@ -668,7 +863,7 @@ class MissionPlannerVisualizer:
             print("⚠ No hay suficientes puntos GPS válidos para graficar")
             return
 
-        plt.figure(figsize=(10, 8))
+        plt.figure(figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_TALL_IN))
         scatter = plt.scatter(
             lon_list, lat_list,
             c=range(len(lat_list)),
@@ -677,7 +872,6 @@ class MissionPlannerVisualizer:
         )
         plt.xlabel('Longitud')
         plt.ylabel('Latitud')
-        plt.title(self._title_with_city('Trayectoria GPS del Octorotor'))
         plt.colorbar(scatter, label='Tiempo (muestras)')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -700,8 +894,10 @@ class MissionPlannerVisualizer:
 
         # Inicializa listas vacías para cada uno de los 8 motores
         motors = {f'Motor{i}': [] for i in range(1, 9)}
+        motor_times = {f'Motor{i}': [] for i in range(1, 9)}
+        source_time_axis = self._build_time_axis_from_messages_global(sources)
 
-        for msg in sources:
+        for msg_idx, msg in enumerate(sources):
             for i in range(1, 9):
                 # Nombres de campo usados por distintas versiones de firmware
                 candidates = (
@@ -728,6 +924,7 @@ class MissionPlannerVisualizer:
                         # Descarta valores fuera del rango PWM físico
                         if PWM_MIN <= pwm <= PWM_MAX:
                             motors[f'Motor{i}'].append(pwm)
+                            motor_times[f'Motor{i}'].append(source_time_axis[msg_idx])
                     except (TypeError, ValueError):
                         pass
 
@@ -738,23 +935,26 @@ class MissionPlannerVisualizer:
             )
             return
 
-        plt.figure(figsize=(14, 8))
+        fig, ax = plt.subplots(
+            1, 1,
+            figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_TALL_IN),
+        )
         for i, (motor_name, values) in enumerate(motors.items(), 1):
             if values:
-                plt.subplot(2, 4, i)
-                plt.plot(values, linewidth=1.5, color=f'C{i - 1}')
-                plt.title(self._title_with_city(motor_name))
-                plt.xlabel('Tiempo')
-                plt.ylabel('PWM (µs)')
-                plt.grid(True, alpha=0.3)
+                ax.plot(
+                    motor_times[motor_name],
+                    values,
+                    linewidth=1.25,
+                    color=f'C{i - 1}',
+                    label=motor_name,
+                )
 
-        plt.suptitle(
-            self._title_with_city('Velocidad de Motores del Octorotor'),
-            fontsize=14,
-            fontweight='bold',
-        )
-        plt.tight_layout()
-        self._save_figure(plt.gcf(), 'motores')
+        ax.set_xlabel('Tiempo (s)', labelpad=2)
+        ax.set_ylabel('PWM (µs)')
+        ax.grid(True, alpha=0.3)
+        self._legend_below(ax, ncol=2, y=-0.20)
+        fig.tight_layout(rect=(0.0, 0.16, 1.0, 1.0))
+        self._save_figure(fig, 'motores')
         plt.show()
 
     def visualize_imu(self):
@@ -773,30 +973,35 @@ class MissionPlannerVisualizer:
             'IMU', ('AccX', 'AccY', 'AccZ', 'GyrX', 'GyrY', 'GyrZ')
         )
         t_s = self._build_time_axis_seconds('IMU')
+        t_start = self._get_flight_start_s()
+        if t_start > 0:
+            mask = [t >= t_start for t in t_s]
+            t_s = [t for t, m in zip(t_s, mask) if m]
+            for field in imu:
+                imu[field] = [v for v, m in zip(imu[field], mask) if m]
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-        fig.subplots_adjust(hspace=0.42)
+        fig, axes = plt.subplots(
+            2, 1,
+            figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_TALL_IN),
+        )
+        fig.subplots_adjust(hspace=1.00, bottom=0.18, top=0.98)
 
         # --- Subgráfica superior: acelerómetro ---
         axes[0].plot(t_s, imu['AccX'], label='AccX', linewidth=1, alpha=0.7)
         axes[0].plot(t_s, imu['AccY'], label='AccY', linewidth=1, alpha=0.7)
         axes[0].plot(t_s, imu['AccZ'], label='AccZ', linewidth=1, alpha=0.7)
-        axes[0].set_xlabel('Tiempo (s)', labelpad=2)
         axes[0].set_ylabel('Aceleración (m/s²)')
-        axes[0].set_title(self._title_with_city('Acelerómetro del IMU'))
-        axes[0].legend()
+        self._legend_below(axes[0], ncol=3, y=-0.22)
         axes[0].grid(True, alpha=0.3)
 
         # --- Subgráfica inferior: giroscopio ---
         axes[1].plot(t_s, imu['GyrX'], label='GyrX', linewidth=1, alpha=0.7)
         axes[1].plot(t_s, imu['GyrY'], label='GyrY', linewidth=1, alpha=0.7)
         axes[1].plot(t_s, imu['GyrZ'], label='GyrZ', linewidth=1, alpha=0.7)
-        axes[1].set_xlabel('Tiempo (s)')
+        axes[1].set_xlabel('Tiempo (s)', labelpad=2)
         axes[1].set_ylabel('Velocidad angular (rad/s)')
-        axes[1].set_title(self._title_with_city('Giroscopio del IMU'), pad=10)
-        axes[1].legend()
+        self._legend_below(axes[1], ncol=3, y=-0.24)
         axes[1].grid(True, alpha=0.3)
-
         fig = plt.gcf()
         self._save_figure(fig, 'imu')
         plt.show()
@@ -813,29 +1018,47 @@ class MissionPlannerVisualizer:
             return
 
         raw = self._extract_series('BAT', ('Volt', 'Curr'))
-        # Filtra valores fuera de rango físico
-        voltage = [v for v in raw['Volt'] if BAT_VOLT_MIN <= v <= BAT_VOLT_MAX]
-        current = [c for c in raw['Curr'] if BAT_CURR_MIN <= c <= BAT_CURR_MAX]
+        bat_t = self._build_time_axis_seconds_global('BAT') or list(range(len(raw['Volt'])))
+        # Filtra valores fuera de rango físico, conservando el eje temporal
+        voltage = []
+        voltage_t = []
+        current = []
+        current_t = []
+        for t, v, c in zip(bat_t, raw['Volt'], raw['Curr']):
+            if BAT_VOLT_MIN <= v <= BAT_VOLT_MAX:
+                voltage.append(v)
+                voltage_t.append(t)
+            if BAT_CURR_MIN <= c <= BAT_CURR_MAX:
+                current.append(c)
+                current_t.append(t)
 
         if not voltage and not current:
             print("⚠ Datos de batería inválidos o fuera de rango")
             return
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+        fig, axes = plt.subplots(
+            2, 1,
+            figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_TALL_IN),
+        )
+
+        fig.subplots_adjust(hspace=0.34)
 
         if voltage:
-            axes[0].plot(voltage, linewidth=2, color='red')
+            axes[0].plot(voltage_t, voltage, linewidth=2, color='red', label='Voltaje')
         axes[0].set_ylabel('Voltaje (V)')
-        axes[0].set_title(self._title_with_city('Voltaje de la Batería'))
+        if voltage:
+            axes[0].legend(loc='upper right', framealpha=0.9)
         axes[0].grid(True, alpha=0.3)
 
         if current:
-            axes[1].plot(current, linewidth=2, color='blue')
-        axes[1].set_xlabel('Tiempo (muestras)')
+            axes[1].plot(current_t, current, linewidth=2, color='blue', label='Corriente')
+        axes[1].set_xlabel('Tiempo (s)', labelpad=2)
         axes[1].set_ylabel('Corriente (A)')
-        axes[1].set_title(self._title_with_city('Corriente de la Batería'))
+        if current:
+            axes[1].legend(loc='upper right', framealpha=0.9)
         axes[1].grid(True, alpha=0.3)
 
+        fig.tight_layout()
         fig = plt.gcf()
         self._save_figure(fig, 'bateria')
         plt.show()
@@ -858,6 +1081,11 @@ class MissionPlannerVisualizer:
             return
 
         elapsed_s, speed_kmh = self._compute_speed_series()
+        t_start = self._get_flight_start_s()
+        if t_start > 0:
+            pairs = [(t, s) for t, s in zip(elapsed_s, speed_kmh) if t >= t_start]
+            if len(pairs) >= 2:
+                elapsed_s, speed_kmh = map(list, zip(*pairs))
 
         if len(speed_kmh) < 2:
             print("⚠ No hay suficientes datos para graficar velocidad")
@@ -865,23 +1093,22 @@ class MissionPlannerVisualizer:
 
         speed_smooth = self._moving_average(speed_kmh, window=SMOOTHING_WINDOW)
 
-        plt.figure(figsize=(12, 6))
+        plt.figure(figsize=(CITY_PLOT_WIDTH_IN, CITY_PLOT_HEIGHT_IN))
         plt.plot(
             elapsed_s, speed_kmh,
             linewidth=1.0, alpha=0.35, color='gray',
-            label='Velocidad bruta',
+            label='Vel. bruta',
         )
         plt.plot(
             elapsed_s, speed_smooth,
             linewidth=2.0, color='purple',
-            label='Velocidad suavizada',
+            label='Vel. suavizada',
         )
-        plt.xlabel('Tiempo (s)')
+        plt.xlabel('Tiempo (s)', labelpad=2)
         plt.ylabel('Velocidad (km/h)')
-        plt.title(self._title_with_city('Velocidad del dron por ruta (GPS)'))
-        plt.legend()
+        self._legend_below(plt.gca(), ncol=2, y=-0.20)
         plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        plt.tight_layout(rect=(0.0, 0.13, 1.0, 1.0))
         self._save_figure(plt.gcf(), 'velocidad')
         plt.show()
 
@@ -942,7 +1169,7 @@ class MissionPlannerVisualizer:
 
         elapsed_s = []
         speed_kmh = []
-        t0 = raw_t[0]
+        t0 = self._get_global_t0_us() or raw_t[0]
         last_t = None
 
         for t_us, spd in zip(raw_t, raw_spd):
@@ -972,7 +1199,7 @@ class MissionPlannerVisualizer:
             )
             return [], []
 
-        t0 = points[0][2]
+        t0 = self._get_global_t0_us() or points[0][2]
         elapsed_s = [0.0]
         speed_kmh = [0.0]
 
@@ -1088,10 +1315,557 @@ def _save_comparison_figure(fig, base_filename):
     filename = f"{base_filename}.png"
     filepath = COMPARISON_OUTPUT_DIR / filename
     try:
-        fig.savefig(filepath, dpi=100, bbox_inches='tight')
+        # Mantiene el tamaño físico de la figura sin recortes automáticos.
+        fig.savefig(filepath, dpi=EXPORT_DPI)
         print(f"  ✓ Comparativa guardada: {filepath.name}")
     except Exception as exc:
         print(f"  ✗ Error guardando {filename}: {exc}")
+
+
+def _create_city_panel_figure(tall=False):
+    """Crea layout 2+1 con Vigo centrada y ejes del mismo tamaño."""
+    fig = plt.figure(
+        figsize=(
+            COMPARISON_PANEL_WIDTH_IN,
+            COMPARISON_PANEL_TALL_HEIGHT_IN if tall else COMPARISON_PANEL_HEIGHT_IN,
+        )
+    )
+    gs = fig.add_gridspec(2, 4, hspace=0.18, wspace=0.40)
+    axes = {
+        'coruna': fig.add_subplot(gs[0, 0:2]),
+        'santiago': fig.add_subplot(gs[0, 2:4]),
+        'vigo': fig.add_subplot(gs[1, 1:3]),
+    }
+    return fig, axes
+
+
+def _panel_label(city_key):
+    """Devuelve la etiqueta de subfigura para cada ciudad."""
+    labels = {
+        'coruna': '(a)',
+        'santiago': '(b)',
+        'vigo': '(c)',
+    }
+    return labels[city_key]
+
+
+def _style_city_panel_axis(ax, city_key, xlabel, ylabel, equal_aspect=False):
+    """Aplica estilo homogéneo a un eje comparativo por ciudad."""
+    ax.set_title(f"{_panel_label(city_key)} {CITY_LABELS[city_key]}", fontsize=11, pad=6)
+    ax.set_xlabel(xlabel, fontsize=11, labelpad=0)
+    if city_key == 'santiago':
+        ax.set_ylabel('')
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+        ax.tick_params(axis='y', labelright=True, labelleft=False, pad=2)
+    else:
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.yaxis.set_label_position('left')
+        ax.yaxis.tick_left()
+        ax.tick_params(axis='y', labelleft=True, labelright=False)
+    ax.tick_params(axis='both', labelsize=11)
+    ax.grid(True, alpha=0.3)
+    if equal_aspect:
+        ax.set_aspect('equal', adjustable='datalim')
+
+
+def _figure_legend(fig, handles, labels, ncol, y=0.005):
+    """Dibuja una única leyenda compartida para toda la figura."""
+    fig.legend(
+        handles,
+        labels,
+        loc='lower center',
+        bbox_to_anchor=(0.5, y),
+        ncol=ncol,
+        frameon=False,
+        fontsize=11,
+    )
+
+
+def _hide_unused_city_axes(axes, visualizers):
+    """Oculta paneles de ciudades sin datos cargados."""
+    for key, ax in axes.items():
+        if key not in visualizers:
+            ax.axis('off')
+
+
+def compare_attitude_panels(visualizers):
+    """Crea una figura 2+1 con la actitud de cada ciudad."""
+    fig, axes = _create_city_panel_figure()
+    plotted = False
+    legend_handles = None
+    legend_labels = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None or 'ATT' not in viz.data:
+            ax.axis('off')
+            continue
+        series = viz._extract_series('ATT', ('Roll', 'Pitch', 'Yaw'))
+        t_s = viz._build_time_axis_seconds('ATT')
+        ax.plot(t_s, series['Roll'], linewidth=1.5, label='Roll')
+        ax.plot(t_s, series['Pitch'], linewidth=1.5, label='Pitch')
+        ax.plot(t_s, series['Yaw'], linewidth=1.5, label='Yaw')
+        _style_city_panel_axis(ax, key, 'Tiempo (s)', 'Ángulo (grados)')
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos de actitud para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, legend_handles, legend_labels, ncol=3, y=0.01)
+    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0), pad=0.1)
+    _save_comparison_figure(fig, 'panel_actitud_ciudades')
+    plt.show()
+
+
+def compare_altitude_panels(visualizers):
+    """Crea una figura 2+1 con la altitud de cada ciudad."""
+    fig, axes = _create_city_panel_figure()
+    plotted = False
+    legend_handles = None
+    legend_labels = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None:
+            ax.axis('off')
+            continue
+        series = viz._extract_series('BARO', ('Alt',))
+        if series is None or not series['Alt']:
+            ax.axis('off')
+            continue
+        t_s = viz._build_time_axis_seconds('BARO')
+        ax.plot(t_s, series['Alt'], linewidth=1.7, color='green', label='Altitud')
+        _style_city_panel_axis(ax, key, 'Tiempo (s)', 'Altitud (m)')
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos de altitud para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, legend_handles, legend_labels, ncol=1, y=0.01)
+    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0), pad=0.1)
+    _save_comparison_figure(fig, 'panel_altitud_ciudades')
+    plt.show()
+
+
+def compare_agl_panels(visualizers):
+    """Crea una figura 2+1 con la altura AGL de cada ciudad."""
+    fig, axes = _create_city_panel_figure()
+    plotted = False
+    legend_handles = None
+    legend_labels = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None or 'TERR' not in viz.data:
+            ax.axis('off')
+            continue
+        agl_raw = viz._extract_series('TERR', ('CHeight',))['CHeight']
+        if not agl_raw or all(v == 0 for v in agl_raw):
+            ax.axis('off')
+            continue
+        # Elimina artefacto de inicialización y fase en tierra previa al despegue
+        first_stable = next((i for i, h in enumerate(agl_raw) if h <= 0.1), 0)
+        first_flight = next(
+            (i for i, h in enumerate(agl_raw)
+             if i >= first_stable and h > 1.0),
+            first_stable,
+        )
+        trim = max(0, first_flight - 5)
+        t_raw = (
+            viz._build_time_axis_seconds_global('TERR')
+            or list(range(len(agl_raw)))
+        )
+        agl = agl_raw[trim:]
+        t_s = t_raw[trim:]
+        if not agl:
+            ax.axis('off')
+            continue
+        ax.fill_between(t_s, 0, agl, color='#c49a6c', alpha=0.35, label='Terreno')
+        ax.plot(t_s, agl, linewidth=1.7, color='orange', label='AGL')
+        _style_city_panel_axis(ax, key, 'Tiempo (s)', 'Altura AGL (m)')
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos AGL para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, legend_handles, legend_labels, ncol=2, y=0.01)
+    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0), pad=0.1)
+    try:
+        fig.set_layout_engine(None)
+    except AttributeError:
+        pass
+    fig.subplots_adjust(top=0.93)
+    _save_comparison_figure(fig, 'panel_agl_ciudades')
+    plt.show()
+
+
+def compare_gps_panels(visualizers):
+    """Crea una figura 2+1 con la trayectoria GPS de cada ciudad."""
+    fig, axes = _create_city_panel_figure(tall=True)
+    plotted = False
+    gps_legend_handles = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None:
+            ax.axis('off')
+            continue
+        points = viz._get_valid_gps_points()
+        if len(points) < 2:
+            ax.axis('off')
+            continue
+        lat0, lon0, _ = points[0]
+        lon_to_m = LAT_TO_M * math.cos(math.radians(lat0))
+        x_m = [(p[1] - lon0) * lon_to_m for p in points]
+        y_m = [(p[0] - lat0) * LAT_TO_M for p in points]
+        line = ax.plot(x_m, y_m, linewidth=1.6, color=CITY_COLORS[key], label='Trayectoria')[0]
+        start = ax.scatter([x_m[0]], [y_m[0]], color=CITY_COLORS[key], s=45, marker='o', zorder=5, label='Inicio')
+        end = ax.scatter([x_m[-1]], [y_m[-1]], color=CITY_COLORS[key], s=45, marker='s', zorder=5, label='Fin')
+        if gps_legend_handles is None:
+            gps_legend_handles = (line, start, end)
+        _style_city_panel_axis(ax, key, 'Desplazamiento E-O (m)',
+                               'Desplazamiento N-S (m)', equal_aspect=True)
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos GPS para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, list(gps_legend_handles), ['Trayectoria', 'Inicio', 'Fin'], ncol=3, y=0.01)
+    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0), pad=0.1)
+    _save_comparison_figure(fig, 'panel_gps_ciudades')
+    plt.show()
+
+
+def compare_motors_panels(visualizers):
+    """Crea una figura 2+1 con las salidas de motores de cada ciudad."""
+    fig, axes = _create_city_panel_figure(tall=True)
+    plotted = False
+    legend_handles = None
+    legend_labels = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None:
+            ax.axis('off')
+            continue
+        sources = viz.data.get('RCOU', []) + viz.data.get('RCO2', [])
+        if not sources:
+            ax.axis('off')
+            continue
+
+        motors = {f'Motor{i}': [] for i in range(1, 9)}
+        motor_times = {f'Motor{i}': [] for i in range(1, 9)}
+        source_time_axis = viz._build_time_axis_from_messages_global(sources)
+
+        for msg_idx, msg in enumerate(sources):
+            for i in range(1, 9):
+                candidates = (f'Ch{i}', f'C{i}', f'Servo{i}', f'SERVO{i}', f'chan{i}_raw')
+                value = None
+                if isinstance(msg, dict):
+                    for candidate in candidates:
+                        if candidate in msg:
+                            value = msg[candidate]
+                            break
+                else:
+                    for candidate in candidates:
+                        if hasattr(msg, candidate):
+                            value = getattr(msg, candidate)
+                            break
+                if value is not None:
+                    try:
+                        pwm = float(value)
+                        if PWM_MIN <= pwm <= PWM_MAX:
+                            motors[f'Motor{i}'].append(pwm)
+                            motor_times[f'Motor{i}'].append(source_time_axis[msg_idx])
+                    except (TypeError, ValueError):
+                        pass
+
+        if not any(motors.values()):
+            ax.axis('off')
+            continue
+
+        for i, (motor_name, values) in enumerate(motors.items(), 1):
+            if values:
+                ax.plot(
+                    motor_times[motor_name],
+                    values,
+                    linewidth=1.0,
+                    color=f'C{i - 1}',
+                    label=f'M{i}',
+                )
+
+        _style_city_panel_axis(ax, key, 'Tiempo (s)', 'PWM (µs)')
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos de motores para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, legend_handles, legend_labels, ncol=4, y=0.05)
+    fig.tight_layout(pad=0.4)
+    fig.subplots_adjust(bottom=0.16)
+    _save_comparison_figure(fig, 'panel_motores_ciudades')
+    plt.show()
+
+
+def compare_imu_panels(visualizers):
+    """Crea una figura 2+1 con IMU por ciudad y dos subpaneles internos."""
+    fig = plt.figure(
+        figsize=(COMPARISON_PANEL_WIDTH_IN, COMPARISON_PANEL_TALL_HEIGHT_IN)
+    )
+    outer = fig.add_gridspec(2, 4, hspace=0.50, wspace=0.45)
+    slot_map = {
+        'coruna': outer[0, 0:2],
+        'santiago': outer[0, 2:4],
+        'vigo': outer[1, 1:3],
+    }
+    plotted = False
+    acc_handles = None
+    acc_labels = None
+    gyr_handles = None
+    gyr_labels = None
+
+    for key in CITY_ORDER:
+        viz = visualizers.get(key)
+        if viz is None or 'IMU' not in viz.data:
+            continue
+        imu = viz._extract_series('IMU', ('AccX', 'AccY', 'AccZ', 'GyrX', 'GyrY', 'GyrZ'))
+        t_s = viz._build_time_axis_seconds('IMU')
+        t_start = viz._get_flight_start_s()
+        if t_start > 0:
+            mask = [t >= t_start for t in t_s]
+            t_s = [t for t, m in zip(t_s, mask) if m]
+            for field in imu:
+                imu[field] = [v for v, m in zip(imu[field], mask) if m]
+        inner = slot_map[key].subgridspec(2, 1, hspace=0.60)
+        ax_acc = fig.add_subplot(inner[0, 0])
+        ax_gyr = fig.add_subplot(inner[1, 0])
+
+        ax_acc.plot(t_s, imu['AccX'], linewidth=1.0, alpha=0.8, color='#1f77b4', label='AccX')
+        ax_acc.plot(t_s, imu['AccY'], linewidth=1.0, alpha=0.8, color='#7b2d8b', label='AccY')
+        ax_acc.plot(t_s, imu['AccZ'], linewidth=1.0, alpha=0.8, color='#17becf', label='AccZ')
+        ax_acc.set_title(f"{_panel_label(key)} {CITY_LABELS[key]}", fontsize=11, pad=6)
+        if key == 'santiago':
+            ax_acc.set_ylabel('')
+            ax_acc.yaxis.set_label_position('right')
+            ax_acc.yaxis.tick_right()
+            ax_acc.tick_params(axis='y', labelright=True, labelleft=False, pad=2)
+        else:
+            ax_acc.set_ylabel('Acel. (m/s²)', fontsize=11)
+            ax_acc.yaxis.set_label_position('left')
+            ax_acc.yaxis.tick_left()
+            ax_acc.tick_params(axis='y', labelleft=True, labelright=False)
+        ax_acc.tick_params(axis='both', labelsize=11)
+        ax_acc.grid(True, alpha=0.3)
+        if acc_handles is None:
+            acc_handles, acc_labels = ax_acc.get_legend_handles_labels()
+
+        ax_gyr.plot(t_s, imu['GyrX'], linewidth=1.0, alpha=0.8, color='#d62728', label='GyrX')
+        ax_gyr.plot(t_s, imu['GyrY'], linewidth=1.0, alpha=0.8, color='#e8c31a', label='GyrY')
+        ax_gyr.plot(t_s, imu['GyrZ'], linewidth=1.0, alpha=0.8, color='#9467bd', label='GyrZ')
+        ax_gyr.set_xlabel('Tiempo (s)', fontsize=11, labelpad=0)
+        if key == 'santiago':
+            ax_gyr.set_ylabel('')
+            ax_gyr.yaxis.set_label_position('right')
+            ax_gyr.yaxis.tick_right()
+            ax_gyr.tick_params(axis='y', labelright=True, labelleft=False, pad=2)
+        else:
+            ax_gyr.set_ylabel('Vel. ang. (rad/s)', fontsize=11)
+            ax_gyr.yaxis.set_label_position('left')
+            ax_gyr.yaxis.tick_left()
+            ax_gyr.tick_params(axis='y', labelleft=True, labelright=False)
+        ax_gyr.tick_params(axis='both', labelsize=11)
+        ax_gyr.grid(True, alpha=0.3)
+        if gyr_handles is None:
+            gyr_handles, gyr_labels = ax_gyr.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos IMU para comparar")
+        return
+
+    _figure_legend(fig, acc_handles, acc_labels, ncol=3, y=0.11)
+    _figure_legend(fig, gyr_handles, gyr_labels, ncol=3, y=0.04)
+    fig.subplots_adjust(bottom=0.25, top=0.94)
+    _save_comparison_figure(fig, 'panel_imu_ciudades')
+    plt.show()
+
+
+def compare_battery_panels(visualizers):
+    """Crea una figura 2+1 con batería por ciudad y dos subpaneles internos."""
+    fig = plt.figure(figsize=(COMPARISON_PANEL_WIDTH_IN, COMPARISON_PANEL_TALL_HEIGHT_IN))
+    outer = fig.add_gridspec(2, 4, hspace=0.22, wspace=0.45)
+    slot_map = {
+        'coruna': outer[0, 0:2],
+        'santiago': outer[0, 2:4],
+        'vigo': outer[1, 1:3],
+    }
+    plotted = False
+    battery_handles = []
+    battery_labels = []
+
+    for key in CITY_ORDER:
+        viz = visualizers.get(key)
+        if viz is None or 'BAT' not in viz.data:
+            continue
+        raw = viz._extract_series('BAT', ('Volt', 'Curr'))
+        bat_time_axis = viz._build_time_axis_seconds('BAT')
+        voltage = []
+        voltage_time = []
+        current = []
+        current_time = []
+
+        for time_s, value in zip(bat_time_axis, raw['Volt']):
+            if BAT_VOLT_MIN <= value <= BAT_VOLT_MAX:
+                voltage.append(value)
+                voltage_time.append(time_s)
+
+        for time_s, value in zip(bat_time_axis, raw['Curr']):
+            if BAT_CURR_MIN <= value <= BAT_CURR_MAX:
+                current.append(value)
+                current_time.append(time_s)
+
+        if not voltage and not current:
+            continue
+
+        inner = slot_map[key].subgridspec(2, 1, hspace=0.35)
+        ax_v = fig.add_subplot(inner[0, 0])
+        ax_c = fig.add_subplot(inner[1, 0])
+
+        if voltage:
+            line_v = ax_v.plot(voltage_time, voltage, linewidth=1.5, color='red', label='Voltaje')[0]
+            if 'Voltaje' not in battery_labels:
+                battery_handles.append(line_v)
+                battery_labels.append('Voltaje')
+        ax_v.set_title(f"{_panel_label(key)} {CITY_LABELS[key]}", fontsize=11, pad=6)
+        if key == 'santiago':
+            ax_v.set_ylabel('')
+            ax_v.yaxis.set_label_position('right')
+            ax_v.yaxis.tick_right()
+            ax_v.tick_params(axis='y', labelright=True, labelleft=False, pad=2)
+        else:
+            ax_v.set_ylabel('Voltaje (V)', fontsize=11)
+            ax_v.yaxis.set_label_position('left')
+            ax_v.yaxis.tick_left()
+            ax_v.tick_params(axis='y', labelleft=True, labelright=False)
+        ax_v.tick_params(axis='both', labelsize=11)
+        ax_v.grid(True, alpha=0.3)
+
+        if current:
+            line_c = ax_c.plot(current_time, current, linewidth=1.5, color='blue', label='Corriente')[0]
+            if 'Corriente' not in battery_labels:
+                battery_handles.append(line_c)
+                battery_labels.append('Corriente')
+        ax_c.set_xlabel('Tiempo (s)', fontsize=11, labelpad=0)
+        if key == 'santiago':
+            ax_c.set_ylabel('')
+            ax_c.yaxis.set_label_position('right')
+            ax_c.yaxis.tick_right()
+            ax_c.tick_params(axis='y', labelright=True, labelleft=False, pad=2)
+        else:
+            ax_c.set_ylabel('Corriente (A)', fontsize=11)
+            ax_c.yaxis.set_label_position('left')
+            ax_c.yaxis.tick_left()
+            ax_c.tick_params(axis='y', labelleft=True, labelright=False)
+        ax_c.tick_params(axis='both', labelsize=11)
+        ax_c.grid(True, alpha=0.3)
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos de batería para comparar")
+        return
+
+    _figure_legend(fig, battery_handles, battery_labels, ncol=2, y=0.01)
+    fig.subplots_adjust(bottom=0.09, top=0.96)
+    _save_comparison_figure(fig, 'panel_bateria_ciudades')
+    plt.show()
+
+
+def compare_speed_panels(visualizers):
+    """Crea una figura 2+1 con la velocidad de cada ciudad."""
+    fig, axes = _create_city_panel_figure()
+    plotted = False
+    legend_handles = None
+    legend_labels = None
+
+    for key, ax in axes.items():
+        viz = visualizers.get(key)
+        if viz is None:
+            ax.axis('off')
+            continue
+        elapsed_s, speed_kmh = viz._compute_speed_series()
+        t_start = viz._get_flight_start_s()
+        if t_start > 0:
+            pairs = [(t, s) for t, s in zip(elapsed_s, speed_kmh) if t >= t_start]
+            if len(pairs) >= 2:
+                elapsed_s, speed_kmh = map(list, zip(*pairs))
+        if len(speed_kmh) < 2:
+            ax.axis('off')
+            continue
+        speed_smooth = MissionPlannerVisualizer._moving_average(speed_kmh, window=SMOOTHING_WINDOW)
+        ax.plot(elapsed_s, speed_kmh, linewidth=1.0, alpha=0.35, color='gray', label='Vel. bruta')
+        ax.plot(elapsed_s, speed_smooth, linewidth=1.8, color='purple', label='Vel. suavizada')
+        _style_city_panel_axis(ax, key, 'Tiempo (s)', 'Velocidad (km/h)')
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        print("⚠ No hay datos de velocidad para comparar")
+        return
+
+    _hide_unused_city_axes(axes, visualizers)
+    _figure_legend(fig, legend_handles, legend_labels, ncol=2, y=0.01)
+    fig.tight_layout(rect=(0.0, 0.07, 1.0, 1.0), pad=0.1)
+    try:
+        fig.set_layout_engine(None)
+    except AttributeError:
+        pass
+    fig.subplots_adjust(top=0.93)
+    _save_comparison_figure(fig, 'panel_velocidad_ciudades')
+    plt.show()
+
+
+def compare_all_city_panels(visualizers):
+    """Genera todas las comparativas por paneles 2+1 entre ciudades."""
+    comparativas = [
+        compare_attitude_panels,
+        compare_altitude_panels,
+        compare_agl_panels,
+        compare_gps_panels,
+        compare_motors_panels,
+        compare_imu_panels,
+        compare_battery_panels,
+        compare_speed_panels,
+    ]
+    for compare_func in comparativas:
+        compare_func(visualizers)
 
 
 def _load_all_visualizers():
@@ -1156,7 +1930,6 @@ def compare_speed(visualizers):
 
     plt.xlabel('Progreso del vuelo (%)')
     plt.ylabel('Velocidad (km/h)')
-    plt.title('Comparativa de Velocidad — A Coruña · Santiago · Vigo')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1198,7 +1971,6 @@ def compare_altitude(visualizers):
 
     plt.xlabel('Progreso del vuelo (%)')
     plt.ylabel('Altitud (m)')
-    plt.title('Comparativa de Altitud Barométrica — A Coruña · Santiago · Vigo')
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1258,9 +2030,6 @@ def compare_altitude_vs_distance(visualizers):
 
     plt.xlabel('Distancia recorrida (km)')
     plt.ylabel('Altitud (m)')
-    plt.title(
-        'Perfil de Altitud vs Distancia — A Coruña · Santiago · Vigo'
-    )
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1313,10 +2082,6 @@ def compare_gps_tracks(visualizers):
 
     plt.xlabel('Desplazamiento Este-Oeste (m)')
     plt.ylabel('Desplazamiento Norte-Sur (m)')
-    plt.title(
-        'Trayectorias GPS Centradas en el Origen'
-        ' — A Coruña · Santiago · Vigo'
-    )
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.axis('equal')
@@ -1398,12 +2163,8 @@ def compare_metrics_dashboard(visualizers):
 
     # Rejilla 2×3: 5 paneles de barras + 1 panel de resumen textual
     # constrained_layout evita recortes del título y solapes entre paneles.
-    fig, axes = plt.subplots(2, 3, figsize=(22, 11), constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(16.8, 9.2), constrained_layout=True)
     fig.patch.set_facecolor('#f0f2f5')
-    fig.suptitle(
-        'Dashboard Comparativo — A Coruña · Santiago · Vigo',
-        fontsize=16, fontweight='bold',
-    )
 
     ax_flat = axes.flatten()
 
@@ -1423,7 +2184,7 @@ def compare_metrics_dashboard(visualizers):
             color=inv_colors,
             edgecolor='white',
             linewidth=1.0,
-            height=0.55,
+            height=0.30,
         )
 
         # Valor a la derecha de cada barra
@@ -1437,7 +2198,7 @@ def compare_metrics_dashboard(visualizers):
                     bar.get_y() + bar.get_height() / 2,
                     fmt.format(val),
                     ha='right', va='center',
-                    fontsize=10, fontweight='bold', color='white',
+                    fontsize=11, fontweight='bold', color='white',
                 )
             else:
                 ax.text(
@@ -1445,14 +2206,28 @@ def compare_metrics_dashboard(visualizers):
                     bar.get_y() + bar.get_height() / 2,
                     fmt.format(val),
                     ha='left', va='center',
-                    fontsize=10, fontweight='bold', color='#333333',
+                    fontsize=11, fontweight='bold', color='#333333',
                 )
 
-        ax.set_title(title, fontsize=11, fontweight='bold', pad=6)
-        ax.set_xlabel(xlabel, fontsize=9, color='#555555')
-        ax.set_xlim(0, max_val * 1.30)
-        ax.tick_params(axis='y', labelsize=9)
-        ax.tick_params(axis='x', labelsize=8)
+        for bar, city_name in zip(bars, inv_labels):
+            bar_w = bar.get_width()
+            x_city = max(bar_w * 0.5, max_val * 0.06)
+            y_city = bar.get_y() - (bar.get_height() * 0.55)
+            ax.text(
+                x_city,
+                y_city,
+                city_name,
+                ha='center',
+                va='top',
+                fontsize=11,
+                color='#444444',
+            )
+
+        ax.set_xlabel(xlabel, fontsize=11, color='#555555')
+        ax.set_xlim(0, max_val * 1.18)
+        ax.tick_params(axis='y', left=False, labelleft=False)
+        ax.tick_params(axis='x', labelsize=11)
+        ax.margins(x=0.0, y=0.28)
         ax.spines[['top', 'right']].set_visible(False)
         ax.grid(axis='x', alpha=0.25, linestyle='--')
 
@@ -1460,7 +2235,7 @@ def compare_metrics_dashboard(visualizers):
     ax_sum = ax_flat[5]
     ax_sum.set_facecolor('#ffffff')
     ax_sum.axis('off')
-    ax_sum.margins(0.1)  # Añade margen interno al panel
+    ax_sum.margins(0.0)  # Sin margen interno para aprovechar el espacio
 
     # Cabecera compacta para evitar solapes de texto en columnas estrechas
     col_headers = ['Ciudad', 'Dist', 'Dur', 'Vel', 'Alt', 'Bat']
@@ -1486,21 +2261,21 @@ def compare_metrics_dashboard(visualizers):
         cellText=rows,
         colLabels=col_headers,
         cellLoc='center',
-        bbox=[0.00, 0.08, 1.00, 0.84],  # Máximo ancho total para todas las columnas
+        bbox=[0.00, 0.00, 1.00, 1.00],  # Ocupa todo el panel para evitar huecos
         colWidths=[0.25, 0.19, 0.14, 0.18, 0.10, 0.14],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(11.5)
-    table.scale(1.70, 2.05)
+    table.set_fontsize(11)
+    table.scale(1.20, 1.42)
 
     # Color de cabecera oscuro, filas con color de ciudad
     for (row, col), cell in table.get_celld().items():
-        cell.PAD = 0.13
+        cell.PAD = 0.06
         cell.set_edgecolor('#bbbbbb')
         cell.set_linewidth(0.5)
         if row == 0:
             cell.set_facecolor('#2a2a2a')
-            cell.set_text_props(color='white', fontweight='bold', fontsize=12)
+            cell.set_text_props(color='white', fontweight='bold', fontsize=11)
         elif row <= len(keys):
             city_key = keys[row - 1]
             r, g, b = plt.matplotlib.colors.to_rgb(CITY_COLORS[city_key])
@@ -1510,11 +2285,9 @@ def compare_metrics_dashboard(visualizers):
         if col == 0 and row > 0:
             cell.get_text().set_ha('left')
 
-    ax_sum.set_title('Resumen', fontsize=10, fontweight='bold', pad=8)
-
-    # Reserva espacio con márgenes internos suficientes.
-    fig.set_constrained_layout_pads(h_pad=0.05, w_pad=0.05, hspace=0.05,
-                                    wspace=0.05)
+    # Compacta la separación entre paneles para reducir espacios en blanco.
+    fig.set_constrained_layout_pads(h_pad=0.02, w_pad=0.02, hspace=0.02,
+                                    wspace=0.02)
     _save_comparison_figure(fig, 'dashboard_metricas')
     plt.show()
 
@@ -1556,9 +2329,6 @@ def compare_battery(visualizers):
 
     plt.xlabel('Progreso del vuelo (%)')
     plt.ylabel('Voltaje (V)')
-    plt.title(
-        'Comparativa de Voltaje de Batería — A Coruña · Santiago · Vigo'
-    )
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -1580,15 +2350,17 @@ def _run_comparison_session(visualizers):
         ("4", "Trayectorias GPS centradas en el origen"),
         ("5", "Dashboard de métricas (distancia, tiempo, vel. media…)"),
         ("6", "Voltaje de batería normalizado"),
-        ("7", "Todas las comparativas"),
+        ("7", "Todas las comparativas superpuestas"),
+        ("8", "Paneles por ciudad (2 arriba + 1 abajo centrada)"),
+        ("9", "Todas las comparativas"),
         ("0", "Omitir"),
     ]
     for num, desc in opciones_comp:
         print(f"  {num}. {desc}")
 
     eleccion = input(
-        "\nSelecciona opción(es) (0-7), "
-        "separadas por coma, p.ej. 1,3,5: "
+        "\nSelecciona opción(es) (0-9), "
+        "separadas por coma, p.ej. 1,3,8: "
     ).strip()
 
     if not eleccion:
@@ -1606,13 +2378,21 @@ def _run_comparison_session(visualizers):
         '4': lambda: compare_gps_tracks(visualizers),
         '5': lambda: compare_metrics_dashboard(visualizers),
         '6': lambda: compare_battery(visualizers),
+        '8': lambda: compare_all_city_panels(visualizers),
     }
 
-    todas = [
+    todas_superpuestas = [
         '1', '2', '3', '4', '5', '6',
     ]
 
+    todas = [
+        '1', '2', '3', '4', '5', '6', '8',
+    ]
+
     if '7' in seleccionadas:
+        seleccionadas = todas_superpuestas
+
+    if '9' in seleccionadas:
         seleccionadas = todas
 
     for opt in seleccionadas:
@@ -1725,6 +2505,7 @@ def main():
     print(SEPARATOR + "\n")
 
     used_cities = set()
+    user_requested_exit = False
 
     while len(used_cities) < len(CITY_ORDER):
         _print_pending_cities(CITY_ORDER, CITY_LABELS, used_cities)
@@ -1732,8 +2513,9 @@ def main():
         eleccion = input("\nSelecciona ciudad (1-3 o nombre): ").strip().lower()
 
         if eleccion == '0':
-            print("Saliendo...")
-            return
+            print("Saliendo del bucle de ciudades...")
+            user_requested_exit = True
+            break
 
         city_key = CITY_ALIASES.get(eleccion)
         if city_key is None:
@@ -1775,11 +2557,12 @@ def main():
                     f"\nCiudad completada. "
                     f"Quedan {restantes} ciudad(es) por ejecutar.\n"
                 )
-    print("\n✅ Ya se ejecutaron las tres ciudades.")
+    if not user_requested_exit and len(used_cities) == len(CITY_ORDER):
+        print("\n✅ Ya se ejecutaron las tres ciudades.")
 
-    # Ofrecer gráficas comparativas entre las tres ciudades
+    # Ofrecer gráficas comparativas al finalizar (aunque se salga antes).
     resp = input(
-        "\n¿Generar gráficas comparativas de las tres ciudades? (s/n): "
+        "\n¿Generar gráficas comparativas disponibles? (s/n): "
     ).strip().lower()
     if resp in ('s', 'si', 'sí', 'y', 'yes'):
         print("\nCargando los tres logs para comparación...")
