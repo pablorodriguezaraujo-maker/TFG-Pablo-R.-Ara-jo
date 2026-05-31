@@ -2,6 +2,7 @@ import argparse
 import io
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -10,6 +11,12 @@ import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+
+warnings.filterwarnings(
+    "ignore",
+    message="constrained_layout not applied",
+    category=UserWarning,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = Path.home() / "Downloads"
@@ -586,7 +593,6 @@ def _save_raster_fig(
     )
     ax.set_xlabel("Longitud (°)")
     ax.set_ylabel("Latitud (°)")
-    ax.set_title(title)
     if show_colorbar:
         cbar = fig.colorbar(im, ax=ax, pad=0.02)
         cbar.set_label(colorbar_label)
@@ -774,7 +780,6 @@ def render_raster_route(
         zorder=9,
     )
 
-    ax2.set_title(f"Ruta optimizada - {city_label}")
     ax2.set_xlabel("Longitud (°)")
     ax2.set_ylabel("Latitud (°)")
 
@@ -858,6 +863,303 @@ def render_raster_route(
     plt.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
     fig2.savefig(output_path, dpi=150)
     plt.close(fig2)
+
+
+# ---------------------------------------------------------------------------
+# PANEL COMPARATIVO 2+1 (A Coruña arriba izquierda, Santiago arriba derecha,
+#                         Vigo abajo centrada)
+# ---------------------------------------------------------------------------
+_CITY_FULL_LABELS = {
+    "coruna": "A Coruña",
+    "santiago": "Santiago de Compostela",
+    "vigo": "Vigo",
+}
+
+_ROUTE_PANEL_LABELS = {
+    "coruna": "(a)",
+    "santiago": "(b)",
+    "vigo": "(c)",
+}
+
+
+def _draw_route_on_ax(
+    ax,
+    obstacles_grid,
+    elevation_grid,
+    full_path,
+    smooth_path,
+    waypoints,
+    emergency_zones,
+    start,
+    end,
+    transform,
+    crs,
+    nx_cells,
+    ny_cells,
+):
+    """Dibuja todos los elementos de ruta sobre un eje ya creado."""
+    extent = grid_extent_latlon(transform, crs, nx_cells, ny_cells)
+    im = ax.imshow(
+        elevation_grid,
+        origin="lower",
+        cmap="terrain",
+        alpha=0.8,
+        extent=extent,
+        aspect="auto",
+        zorder=1,
+    )
+    add_wind_overlay(ax, nx_cells, ny_cells, transform=transform, crs=crs)
+
+    obs_y, obs_x = np.where(obstacles_grid)
+    obs_lats, obs_lons = grid_path_to_latlon(
+        list(zip(obs_x.tolist(), obs_y.tolist())),
+        transform, crs, ny_cells,
+    )
+    ax.scatter(obs_lons, obs_lats, c="black", s=8, marker="s", zorder=5)
+
+    if full_path:
+        full_lats, full_lons = grid_path_to_latlon(full_path, transform, crs, ny_cells)
+        ax.plot(full_lons, full_lats, c="orange", lw=1.0, alpha=0.6, zorder=6)
+        ax.scatter(full_lons, full_lats, c="orange", s=4, alpha=0.35, zorder=6)
+
+    if smooth_path:
+        smooth_lats, smooth_lons = grid_path_to_latlon(smooth_path, transform, crs, ny_cells)
+        ax.plot(smooth_lons, smooth_lats, c="red", lw=2.0, zorder=7)
+
+    if waypoints:
+        way_lats, way_lons = grid_path_to_latlon(waypoints, transform, crs, ny_cells)
+        ax.scatter(way_lons, way_lats, c="blue", s=30, marker="o", zorder=8)
+
+    if emergency_zones:
+        e_cells = [cell for cell, *_ in emergency_zones]
+        e_lats, e_lons = grid_path_to_latlon(e_cells, transform, crs, ny_cells)
+        ax.scatter(
+            e_lons, e_lats, c="cyan", s=55, marker="^",
+            edgecolors="black", linewidths=0.5, zorder=8,
+        )
+
+    s_lat, s_lon = grid_to_latlon(start[0], start[1], transform, crs, ny_cells)
+    e_lat, e_lon = grid_to_latlon(end[0], end[1], transform, crs, ny_cells)
+    ax.scatter([s_lon], [s_lat], c="green", s=100, marker="*", zorder=9)
+    ax.scatter([e_lon], [e_lat], c="magenta", s=100, marker="X", zorder=9)
+
+    return im
+
+
+def render_combined_route_panel(city_data):
+    """Crea la figura comparativa 2+1 con rutas optimizadas de las tres ciudades."""
+    # Ancho = área imprimible A4 (márgenes 3.5 cm + 2.0 cm), igual que paneles TFG
+    _page_w = (21.0 - 3.5 - 2.0) / 2.54  # ≈ 6.10 in
+    fig = plt.figure(figsize=(_page_w, 9.0), layout="constrained")
+    fig.get_layout_engine().set(w_pad=4/72, h_pad=4/72, wspace=0.01, hspace=0.05)
+    gs = fig.add_gridspec(2, 4)
+    # Vigo alineado con A Coruña (cols 0-1); cols 2-3 fila 1 reservadas para colorbars
+    slot_map = {
+        "coruna": gs[0, 0:2],
+        "santiago": gs[0, 2:4],
+        "vigo": gs[1, 0:2],
+    }
+    order = ["coruna", "santiago", "vigo"]
+
+    ims = {}
+    for key in order:
+        if key not in city_data:
+            continue
+        d = city_data[key]
+        ax = fig.add_subplot(slot_map[key])
+        im = _draw_route_on_ax(
+            ax,
+            d["obstacles_grid"],
+            d["elevation_grid"],
+            d["full_path"],
+            d["smooth_path"],
+            d["waypoints"],
+            d["emergency_zones"],
+            d["start"],
+            d["end"],
+            d["transform"],
+            d["crs"],
+            d["nx_cells"],
+            d["ny_cells"],
+        )
+        ims[key] = im
+        ax.set_title(
+            f"{_ROUTE_PANEL_LABELS[key]} {_CITY_FULL_LABELS[key]}",
+            fontsize=9, pad=3,
+        )
+        ax.set_xlabel("Longitud (\u00b0)", fontsize=9, labelpad=1)
+        ax.tick_params(axis="both", labelsize=8)
+        ax.set_ylabel("Latitud (\u00b0)", fontsize=9, labelpad=1)
+        if key == "santiago":
+            ax.yaxis.set_label_position("right")
+            ax.yaxis.tick_right()
+            ax.tick_params(axis="y", labelleft=False, labelright=True)
+        else:
+            ax.yaxis.set_label_position("left")
+            ax.yaxis.tick_left()
+            ax.tick_params(axis="y", labelleft=True, labelright=False)
+
+    # Tres barras de color juntas en gs[1, 2:4], una por ciudad
+    cbar_gs = gs[1, 2:4].subgridspec(1, 3, wspace=2.5)
+    for i, key in enumerate(order):
+        if key not in ims:
+            continue
+        cax = fig.add_subplot(cbar_gs[0, i])
+        cbar = fig.colorbar(ims[key], cax=cax)
+        cbar.set_label(
+            f"{_ROUTE_PANEL_LABELS[key]}\nElev. (m)",
+            fontsize=8,
+        )
+        cbar.ax.tick_params(labelsize=7)
+
+    legend_handles = [
+        Patch(facecolor="black", edgecolor="black", label="Obst\u00e1culos"),
+        Line2D([0], [0], color="orange", lw=1.2, label="Ruta grid"),
+        Line2D([0], [0], color="red", lw=2.0, label="Ruta suavizada"),
+        Line2D([0], [0], marker="o", color="blue", lw=0, markersize=7,
+               label="Puntos intermedios"),
+        Line2D([0], [0], marker="^", markerfacecolor="cyan",
+               markeredgecolor="black", color="cyan", lw=0, markersize=8,
+               label="Aterrizaje emergencia"),
+        Line2D([0], [0], marker="*", color="green", lw=0, markersize=10,
+               label="Inicio"),
+        Line2D([0], [0], marker="X", color="magenta", lw=0, markersize=8,
+               label="Fin"),
+        Line2D([0], [0], color="deepskyblue", lw=2, label="Viento espiral"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="outside lower center",
+        ncol=4,
+        fontsize=9,
+        framealpha=0.95,
+        handlelength=1.5,
+        handletextpad=0.4,
+        columnspacing=0.8,
+    )
+
+    out_path = resource_path("outputs") / "panel_rutas_ciudades.png"
+    resource_path("outputs").mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    print(f"  \u2713 Panel comparativo guardado: {out_path}")
+
+
+def render_combined_obstacle_panel(city_data):
+    """Crea la figura comparativa 2+1 con el raster de obstáculos de las tres ciudades."""
+    _page_w = (21.0 - 3.5 - 2.0) / 2.54  # ≈ 6.10 in
+    fig = plt.figure(figsize=(_page_w, 7.0), layout="constrained")
+    fig.get_layout_engine().set(w_pad=4/72, h_pad=4/72, wspace=0.02, hspace=0.05)
+    gs = fig.add_gridspec(2, 4)
+    slot_map = {
+        "coruna": gs[0, 0:2],
+        "santiago": gs[0, 2:4],
+        "vigo": gs[1, 1:3],
+    }
+    order = ["coruna", "santiago", "vigo"]
+
+    for key in order:
+        if key not in city_data:
+            continue
+        d = city_data[key]
+        ax = fig.add_subplot(slot_map[key])
+        extent = grid_extent_latlon(d["transform"], d["crs"], d["nx_cells"], d["ny_cells"])
+        ax.imshow(
+            d["obstacles_grid"],
+            origin="lower",
+            cmap="gray",
+            extent=extent,
+            aspect="auto",
+            zorder=1,
+        )
+        ax.set_title(
+            f"{_ROUTE_PANEL_LABELS[key]} {_CITY_FULL_LABELS[key]}",
+            fontsize=11, pad=4,
+        )
+        ax.set_xlabel("Longitud (\u00b0)", fontsize=11, labelpad=2)
+        ax.tick_params(axis="both", labelsize=10)
+        ax.set_ylabel("Latitud (\u00b0)", fontsize=11)
+        ax.yaxis.set_label_position("left")
+        ax.yaxis.tick_left()
+        ax.tick_params(axis="y", labelleft=True, labelright=False)
+
+    out_path = resource_path("outputs") / "panel_obstaculos_ciudades.png"
+    resource_path("outputs").mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    print(f"  \u2713 Panel obstáculos guardado: {out_path}")
+
+
+def render_combined_elevation_panel(city_data):
+    """Crea la figura comparativa 2+1 con el raster de elevación de las tres ciudades."""
+    _page_w = (21.0 - 3.5 - 2.0) / 2.54  # ≈ 6.10 in
+    fig = plt.figure(figsize=(_page_w, 9.0), layout="constrained")
+    fig.get_layout_engine().set(w_pad=4/72, h_pad=0, wspace=0.01, hspace=0.05, rect=(0.0, 0.0, 1.0, 1.0))
+    gs = fig.add_gridspec(2, 4)
+    # Vigo alineado con A Coruña (cols 0-1); cols 2-3 fila 1 reservadas para colorbars
+    slot_map = {
+        "coruna": gs[0, 0:2],
+        "santiago": gs[0, 2:4],
+        "vigo": gs[1, 0:2],
+    }
+    order = ["coruna", "santiago", "vigo"]
+
+    ims = {}
+    for key in order:
+        if key not in city_data:
+            continue
+        d = city_data[key]
+        ax = fig.add_subplot(slot_map[key])
+        extent = grid_extent_latlon(d["transform"], d["crs"], d["nx_cells"], d["ny_cells"])
+        im = ax.imshow(
+            d["elevation_grid"],
+            origin="lower",
+            cmap="terrain",
+            extent=extent,
+            aspect="auto",
+            zorder=1,
+        )
+        ims[key] = im
+        ax.set_title(
+            f"{_ROUTE_PANEL_LABELS[key]} {_CITY_FULL_LABELS[key]}",
+            fontsize=9, pad=3,
+        )
+        ax.set_xlabel("Longitud (\u00b0)", fontsize=9, labelpad=1)
+        ax.set_ylabel("Latitud (\u00b0)", fontsize=9, labelpad=1)
+        ax.tick_params(axis="both", labelsize=8)
+        if key == "santiago":
+            ax.yaxis.set_label_position("right")
+            ax.yaxis.tick_right()
+            ax.tick_params(axis="y", labelleft=False, labelright=True)
+        else:
+            ax.yaxis.set_label_position("left")
+            ax.yaxis.tick_left()
+            ax.tick_params(axis="y", labelleft=True, labelright=False)
+
+    # Tres barras de color juntas en gs[1, 2:4], una por ciudad
+    cbar_gs = gs[1, 2:4].subgridspec(1, 3, wspace=2.5)
+    for i, key in enumerate(order):
+        if key not in ims:
+            continue
+        cax = fig.add_subplot(cbar_gs[0, i])
+        cbar = fig.colorbar(ims[key], cax=cax)
+        # Ticks explícitos para garantizar que aparece el máximo
+        vmin_c = ims[key].norm.vmin
+        vmax_c = ims[key].norm.vmax
+        ticks = np.linspace(vmin_c, vmax_c, 5)
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{t:.0f}" for t in ticks])
+        cbar.set_label(
+            f"{_ROUTE_PANEL_LABELS[key]}\nElev. (m)",
+            fontsize=8,
+        )
+        cbar.ax.tick_params(labelsize=7)
+
+    out_path = resource_path("outputs") / "panel_elevacion_ciudades.png"
+    resource_path("outputs").mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    print(f"  \u2713 Panel elevaci\u00f3n guardado: {out_path}")
 
 
 def execute_raster_route(
@@ -1278,7 +1580,6 @@ def execute_raster_route(
         borderaxespad=0.0,
         framealpha=0.95,
     )
-    ax_a.set_title(f"Ruta optimizada - {cfg['label']}")
     ax_a.set_xlabel("Longitud (°)")
     ax_a.set_ylabel("Latitud (°)")
     plt.tight_layout(rect=(0.0, 0.12, 1.0, 1.0))
@@ -1315,13 +1616,28 @@ def execute_raster_route(
         plt.show()
     plt.close(fig_a)
 
+    return {
+        "obstacles_grid": obstacles_grid,
+        "elevation_grid": elev_arr,
+        "full_path": full_route,
+        "smooth_path": smooth,
+        "waypoints": inter,
+        "emergency_zones": emergency_zones,
+        "start": start_used,
+        "end": end_used,
+        "transform": elev_transform,
+        "crs": elev_crs,
+        "nx_cells": nx_cells,
+        "ny_cells": ny_cells,
+    }
+
 
 def run_city(city, show_plots=True, save_animations=True):
     """Lanzo el flujo completo para la ciudad seleccionada."""
     cfg = CITY_CONFIG[city]
     outputs = city_outputs(city)
     print(f"\n=== Ejecutando ciudad: {cfg['label']} ===")
-    execute_raster_route(
+    return execute_raster_route(
         cfg,
         outputs,
         save_animations,
@@ -1396,17 +1712,24 @@ def main():
         )
         return
 
+    collected_data = {}
     pending_cities = list(CITY_CONFIG.keys())
     while pending_cities:
         city = choose_city_interactively(pending_cities)
-        run_city(
+        data = run_city(
             city=city,
             show_plots=show_plots,
             save_animations=save_animations,
         )
+        if data is not None:
+            collected_data[city] = data
         pending_cities.remove(city)
 
     print("\nYa se han ejecutado las tres ciudades. Fin de la sesión interactiva.")
+    if len(collected_data) == len(CITY_CONFIG):
+        render_combined_obstacle_panel(collected_data)
+        render_combined_elevation_panel(collected_data)
+        render_combined_route_panel(collected_data)
 
 
 if __name__ == "__main__":
